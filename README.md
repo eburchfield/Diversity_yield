@@ -7,3 +7,4 @@ This repository contains all of the scripts use to create data and run analyses 
 *SM_national_model_robustness.html documents robustness checks for the national models.
 *SM_regional_model_estimation_and_checks.html documents regional model results.
 
+You can preview html docs here: https://htmlpreview.github.io/
