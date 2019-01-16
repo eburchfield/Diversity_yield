@@ -1,0 +1,1209 @@
+---
+title: 'The  impact of agricultural diversification on U.S. crop production: National
+  Corn Models Sensitivity and Robustness Checks'
+author: "Kate Nelson"
+date: "12/15/2018"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+This file contains robustness and sensitivity checks for models evaluating the imapact of agriculutral diversification on U.S. crop production. To reduce the number of models evaluated only national level models for corn using the richness diversity index are examined in this document.
+
+```{r setup, include=FALSE, cache=T}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(comment = NA)
+library(ggplot2)
+library(dplyr)
+library(sf)
+library (INLA)
+library(raster)
+library(sp)
+library(spdep)
+library(rgeos)
+library(ggpubr)
+library(knitr)
+library(doParallel)
+
+```
+
+
+
+```{r readdat, echo=FALSE, warnings=F, messages=F, comment=NA, cache=T}
+#Read in datasets 
+
+    wd<-getwd()
+
+    cnty<-readRDS(paste0(wd,"/county.RDS"))
+    projection<-cnty@proj4string@projargs
+    cnty<-st_as_sf(cnty)
+    cnty<-cnty[,c(5,11)] 
+    
+    AER<-readRDS(paste0(wd,"/us_eco_l3.rds"))
+    AER<-st_as_sf(AER)
+    AER<-st_transform(AER,projection)
+    AER$AERCODE<-seq(1:length(AER$US_L3CODE))
+    AER<-AER[,"AERCODE"]
+    
+    d<-readRDS(paste0(wd, "/fullpanelnew_reg.rds"))
+    d <- d %>% filter(YEAR < 2017) %>% filter(YEAR > 2009) #this is an optional subset select that removes years for which we might not have a full growing season of data for winter wheat
+    
+
+```
+
+
+
+
+```{r adjacency, cache=T, comment=NA, include=FALSE, messages=F, warnings=F}
+
+
+prep_adjacency<-function(data, crop){
+
+  df<-data
+##build list of counties growing crop of interest
+   d_crop<-df[df$CROP == crop & !is.na(df$YIELD),] #extract data for crop of interest for location-times when production occured
+    names<-unique(d_crop$GEOID)
+  
+##clip county file to cropproducing areas and setup indexing by CNTY
+  cnty_dup<-cnty #save a copy of county file for later use
+  cnty<-cnty[cnty$GEOID %in% names,] #subset to cnty growing crop
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_crop<-cnty #save a copy of the crop producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_crop<-left_join(d_crop,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  d_crop<-d_crop[order(d_crop$CNTY, d_crop$YEAR),]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book (Blangiardo, M., & Cameletti, M. (2015). Spatial and spatio-temporal Bayesian models with R-INLA. John Wiley & Sons.) 
+ 
+##Build the relational matrix for areas of interest
+    cnty_crop<-as(cnty_crop,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_crop, queen=F) #create neighbors list from polygon object, neighbors share one or more points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.", crop,".rds"))
+   
+
+##Add AER index
+  
+  names<-unique(d_crop$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  AER_dup<-AER #save a copy of county file for later use
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  AER_crop<-AER #save a copy of the crop producing counties file for building the relational matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_crop<-rename(d_crop,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_crop<-left_join(d_crop,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_crop<-d_crop[order(d_crop$AERCODE, d_crop$YEAR),]#Ordering dataset by location then time 
+  
+#save crop dataset with indexes
+  saveRDS(d_crop, paste0(wd,"/output/d_", crop,".rds"))
+}
+
+#build and read crop specific dataset and adjacency matrix
+  #prep_adjacency(d,"corn")
+  d_corn<-readRDS(paste0(wd,"/output/d_corn.rds"))
+  H.adj.corn<-readRDS(paste0(wd,"/output/","H.adj.corn.rds"))
+  #plot spatial object
+    image(inla.graph2matrix(H.adj.corn), xlab="", ylab="")
+    
+  #prep_adjacency(d,"soy")
+  d_soy<-readRDS(paste0(wd,"/output/d_soy.rds"))
+  H.adj.soy<-readRDS(paste0(wd,"/output/","H.adj.soy.rds"))
+  #plot spatial object
+    image(inla.graph2matrix(H.adj.soy), xlab="", ylab="")
+    
+  #prep_adjacency(d,"wwheat")
+  d_wwheat<-readRDS(paste0(wd,"/output/d_wwheat.rds"))
+  H.adj.wwheat<-readRDS(paste0(wd,"/output/","H.adj.wwheat.rds"))
+  #plot spatial object
+    image(inla.graph2matrix(H.adj.wwheat), xlab="", ylab="")
+    
+    
+```
+
+
+
+
+```{r define_fcns, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+## DEFINE FUNCTIONS
+
+# Setup some basic functions to run models and provide model results, diagnostics, and plots. 
+
+run.model<-function(formula, data, crop, name){
+  df<-data[data$CROP %in% crop,] #define the dataset for the crop of interest
+  #y<-df$YIELD #specify the dependent variable
+  OUT<-inla(formula, data=df, family = "gaussian",     
+          control.predictor = list( compute=TRUE), control.compute=list(dic=TRUE, cpo=TRUE), control.fixed = list(prec = 0.0000001)) #run the inla model
+  saveRDS(OUT, file=paste0(wd,"/output/",name ,".rds")) #save the model output
+}
+
+model.results<-function(model_results_name, data="d", crop="corn", diagnostics = TRUE){
+  results<-readRDS(paste0(wd,"/output/",model_results_name,".rds"))
+  data<-data[data$CROP %in% crop,] #subset data by crop of interest
+  data<-as.data.frame(data)
+  summary<-summary(results)
+  if (diagnostics == TRUE){ #if diagnostics turned on return the dic, cpo, and pit
+    #R_INLA Diagnostics
+    DIC<-(results$dic$dic)
+    CPO<-(sum(log(results$cpo$cpo), na.rm=T)) 
+    h<-ggplot(as.data.frame(results$cpo$pit), aes(x=results$cpo$pit)) + geom_histogram() + ggtitle( "Model PIT")
+    #PPC Distribution Checks
+    p_val<-c()
+    n<-length(data$YIELD)
+    for(i in (1:n)){
+      p_val[i]<-inla.pmarginal(q=data$YIELD[i],
+                               marginal=results$marginals.fitted.values[[i]])
+    }
+    data<-cbind(data,results$summary.fitted.values$mean)
+    colnames(data)[dim(data)[2]]<-c("FittedVals")
+    dat<-select_at(data, c("YIELD","FittedVals")) %>% mutate_all(.,funs(exp))
+     p1<-ggplot(as.data.frame(dat[!is.na(dat$YIELD),]), aes(x=YIELD,y=FittedVals)) + geom_point(size=0.2, color="blue") +
+      ggtitle("Scatter Plot of Predicted and Observed Values")  + xlab("Observed Value") + ylab("Mean of Post. Pred. Distr.")
+  
+    p2<-ggplot(as.data.frame(p_val), aes(x=p_val)) + geom_histogram() + ggtitle("Posterior Predictive p-values")
+    
+    #PPC Summary Metrics
+    sq_dif<-(data$YIELD-data$FittedVals)^2
+    MSE<-1/n*(sum(sq_dif,na.rm=T))
+    
+    pred_res2<-(data$FittedVals[!is.na(data$YIELD)] - mean(data$YIELD, na.rm=T)) ^2
+    obs_res2<-(data$YIELD[!is.na(data$YIELD)] - mean(data$YIELD, na.rm=T))^2
+    R2<-sum(pred_res2, na.rm=T)/sum(obs_res2, na.rm=T)
+    
+    #OUPUTS
+    summtable<-as.data.frame(summary$fixed[,1:5])
+    summtable.pt2<-as.data.frame(summary$hyperpar[,1:5])
+    summtable<-rbind(summtable,summtable.pt2)
+    summtable<-kable(summtable, caption="Summary Table of Model Estimates")
+    
+    Diagnostics<-as.data.frame(t(c(DIC,CPO,MSE,R2)))
+    colnames(Diagnostics)<-c("DIC","CPO","MSE","R2")
+    Diagnostics<-kable(Diagnostics, caption="Model Diagnostic Metrics")
+    
+    # figure<-ggarrange(h,p1,p2,ncol=3,nrow=1)
+    # annotate_figure(figure, top= text_grob("Model Diagnostic Plots"))
+    
+    my_list<-list(summtable,   Diagnostics)
+  return(my_list)
+  }  
+  my_list<-list(summary)
+  return(my_list)
+}
+
+
+crossval.randho<-function(model_results_name, formula= "formula", data="d", crop="corn", n=1/7){
+#using a completely random hold-out sample works better than holding out an entire year as we retain enough info to have reliable random effects
+d_ho<-data
+
+#select random subset to withhold from evaluation if you have not already done so
+if (!file.exists(paste0(wd,"/output/hoidx_",model_results_name,".rds"))){ 
+     idx<-sample(seq(1:length(d_ho$YIELD)), length(d_ho$YIELD)*n) #1/7 sample
+    saveRDS(idx,paste0(wd,"/output/hoidx_",model_results_name,".rds"))}
+
+idx<-readRDS(paste0(wd,"/output/hoidx_",model_results_name,".rds"))
+
+#build the subset for evaluation
+d_ho$YIELD[idx]<-NA
+
+if (!file.exists(paste0(wd,"/output/",model_results_name,".rds"))){ 
+      run.model(formula, d_ho,crop,model_results_name)
+}
+
+      df<-st_as_sf(data)
+      results<-readRDS(paste0(wd,"/output/",model_results_name,".rds"))
+  
+      df<-cbind(df,results$summary.fitted.values$mean)
+      df$error<-df$YIELD-df$results.summary.fitted.values.mean
+      #hist(data$error)
+      
+      #MSE and R2 for held-out sample 
+     df_sub<-df[idx,]
+     n<-length(df_sub$YIELD)
+     df_sub<-df_sub[df_sub$error<10,]
+     cnt_outliers<-length(df_sub[df_sub$error<10,1])#i remove two outliers that doubles the predicted residuals, upon examination the extremely low predicted yield (close to zero after back transformed seems to be due in part to discrepant TP values 
+  
+     
+    sq_dif<-(df_sub$error)^2
+    MSE<-1/n*(sum(sq_dif,na.rm=T))
+    
+    pred_res2<-(df_sub$results.summary.fitted.values.mean [!is.na(df_sub$YIELD)] - mean(df_sub$YIELD, na.rm=T)) ^2
+    obs_res2<-(df_sub$YIELD[!is.na(df_sub$YIELD)] - mean(df_sub$YIELD, na.rm=T))^2
+    R2<-sum(pred_res2, na.rm=T)/sum(obs_res2, na.rm=T)
+    Gelman_R2<-(sum(pred_res2)/(sum(pred_res2)+sum(sq_dif)))
+    NSE<-1-(sum(sq_dif,na.rm=T)/sum(obs_res2, na.rm=T))
+    
+    Cross_Val_Metrics<-as.data.frame(t(c(R2,MSE,NSE, cnt_outliers)))
+    colnames(Cross_Val_Metrics)<-c("R2","MSE","NSE","OutlierCount")
+    saveRDS(Cross_Val_Metrics, paste0(wd,"/output/cv_",model_results_name,".rds"))
+    Cross_Val_Metrics<-kable(Cross_Val_Metrics, caption="Cross Validation Diagnostic Metrics")
+    
+    return(Cross_Val_Metrics)
+}
+
+
+plot.spatialeffect<-function(model_results_name, data, crop, type ="BYM", scale="CNTY"){
+  df<-data[data$CROP %in% crop,] #subset data by crop of interest
+  df<-st_as_sf(df)
+  results<-readRDS(paste0(wd,"/output/",model_results_name,".rds"))
+  
+  if (type =="BYM"){ #Spatial effect for bym models
+    if (scale =="CNTY"){ #County spatial effects
+      Nareas<-length(unique(df$CNTY)) #number of unique spatial locations in dataset
+      asr<-results$summary.random$CNTY[1:Nareas,c(1,2,3)]#extract the area-specific residuals
+    
+      #Create spatial dataframe with information for map 
+      map.asr<-left_join(df[,c("CNTY","GEOID","geometry")],asr,by=c("CNTY"="ID"))
+      #map.asr<-map.asr[,c(-1)]
+      colnames(map.asr)<-c("CNTY","GEOID","Mean","Standard_Deviation","geometry")
+            #plot(map.asr, main= "Area Specific Residuals"
+      saveRDS(map.asr,paste0(wd,"/output/",model_results_name,"_asr.rds"))
+     
+     #calculate spatially structured variance if using BYM
+          # mat.marg <-matrix(NA, nrow=Nareas,ncol=100000)
+          # m<-results$marginals.random$CNTY
+          # for (i in 1:Nareas){
+          #   u<- m[[Nareas+i]]
+          #   mat.marg[i,]<-inla.rmarginal(100000,u)
+          # }
+          # var.u<-apply(mat.marg,2,var)
+          # 
+          # 
+          # #fraction of area effect that is iid structured
+          # var.v<-inla.rmarginal(100000,inla.tmarginal (function(x) 1/x, results$marginals.hyperpar$`Precision for CNTY (iid component)`)) 
+          #   #var.u<-inla.rmarginal(100000,inla.tmarginal (function(x) 1/x, results$marginals.hyperpar$`Precision for CNTY (spatial component)`)) #using this                   gives nearly the same results as the rmarginal approach
+          # 
+          # 
+          # #compute spatial fraction of variance
+          # perc.var.u<-mean(var.u/(var.u+var.v))
+      
+    #Report proportion of variance that is spatially structured if using BYM2
+      perc.var.u<-round(results$summary.hyperpar["Phi for CNTY","0.5quant"], digits=4) 
+     
+  #Plot spatial effects 
+     require(viridis)
+      p1 <- ggplot() +
+      geom_sf(data = map.asr, color = "white", size = 0.05, aes(fill = Mean)) +
+        ggtitle(paste("Mean of Area Specific Residuals for", model_results_name)) +
+        theme_minimal() + scale_fill_viridis(option = "magma")
+      p1<-annotate_figure(p1, bottom = text_grob(paste0("Fraction of variance that is spatially structured:", perc.var.u)))
+        
+        
+      # p1<-plot(map.asr[,3], main= paste("Mean of Area Specific Residuals for", model_results_name), lwd=0.5, key.pos=1)
+      #          mtext(paste0("Fraction of variance that is spatially structured:", perc.var.u), side=1) 
+      # p1<-print(p1)
+      
+      p2 <- ggplot() +
+        ggtitle(paste0("Standard Deviation of Area Specific Residuals for", model_results_name)) +
+      geom_sf(data = map.asr, color = "white", size = 0.05, aes(fill = Standard_Deviation)) +
+        theme_minimal() + scale_fill_viridis(option = "magma")
+      
+      # p2<-plot(map.asr[,4], main=paste("Standard Deviation of Area Specific Residuals for", model_results_name), lwd=0.5, key.pos=1)
+      # p2<-print(p2)
+      
+      #my_list<-list(p1,p2,"Fraction of Area Residuals that is Spatially Structured", perc.var.u)
+      my_list<-list(p1,p2)
+      
+      return (my_list)
+    }
+    
+     
+  }
+    
+}
+
+
+
+plot.smootheffect<-function(model_results_name, var="SDI"){
+  
+   results<-readRDS(paste0(wd,"/output/",model_results_name,".rds"))
+   
+   if(var=="SDI"){
+        
+        p2<-ggplot(data=results$summary.random$SDI[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+   }
+   
+   if(var=="SIDI"){
+        
+        p2<-ggplot(data=results$summary.random$SIDI[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+   }
+     if(var=="RICH"){
+        
+        p2<-ggplot(data=results$summary.random$RICH[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+   }
+   if(var=="TP"){
+     
+        p2<-ggplot(data=results$summary.random$TP[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))  
+
+   }
+   if(var=="EfP"){
+       
+        p2<-ggplot(data=results$summary.random$EfP[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))  
+
+   }
+     if(var=="ExP"){
+       
+        p2<-ggplot(data=results$summary.random$ExP[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+     }
+     if(var=="GDD"){
+       
+        p2<-ggplot(data=results$summary.random$GDD[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+     }
+     if(var=="SDD"){
+       
+        p2<-ggplot(data=results$summary.random$SDD[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2)) 
+   
+     }
+    if(var=="Yr"){
+       
+        p2<-ggplot(data=results$summary.random$Yr[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2)) 
+     
+   }
+  
+  
+}
+
+plot.us<-function(directory, metrics, crops, landscape, climatevars, subplot.labels, y.min, y.max, x.min, x.max){
+      
+      metrics.labels<-toupper(metrics)
+      crops.labels<-crops
+      crops.labels[crops.labels == "wwheat"] <- "Winter wheat" 
+      crops.labels[crops.labels == "corn"] <- "Corn" 
+      crops.labels[crops.labels == "soy"] <- "Soy"
+      
+      n<-length(climatevars)
+      registerDoParallel(n)
+      my.plots<-c()
+      getDoParWorkers() 
+      
+      foreach(j=1:n, .packages="ggplot2") %dopar% {
+      my.plots<-c()
+      
+      for (i in 1:length(metrics)){
+        
+        #pull the model output by metric for ag diversity
+        results_1<-readRDS(paste0(directory , metrics[i], "_us_", crops[1], "_", landscape,".rds"))
+        results_2<-readRDS(paste0(directory , metrics[i], "_us_", crops[2], "_",landscape,".rds"))
+        results_3<-readRDS(paste0(directory , metrics[i], "_us_", crops[3], "_",landscape,".rds"))
+        
+        
+        #pull the results for the effect of the metric
+        results_1a<-get(climatevars[j],results_1$summary.random)[ ,c(1,4,5,6)]
+        results_2a<-get(climatevars[j],results_2$summary.random)[ ,c(1,4,5,6)]
+        results_3a<-get(climatevars[j],results_3$summary.random)[ ,c(1,4,5,6)]
+        
+        #add crop column
+        results_1a$Crop<-crops.labels[1]
+        results_2a$Crop<-crops.labels[2]
+        results_3a$Crop<-crops.labels[3]
+        
+        #combine data for a single plot
+        results_tot<-as.data.frame(rbind(results_1a,results_2a,results_3a))
+        results_tot$ClimateVars<-climatevars[j]
+        
+        #build a plot
+        #group.colors<-c("corn" ="#F8766D","soy" ="#00BA38", "winter wheat" ="#619CFF")
+        p1<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Crop, col=Crop), size=1) + 
+         # scale_colour_manual(values=group.colors)+
+          xlim(x.min[j], x.max[j]) + ylim(y.min[j],y.max[j]) + 
+          xlab(paste0(climatevars[j])) + ylab("Effect on log(Yield)") + ggtitle (metrics.labels[i]) +
+          geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Crop, fill=Crop), alpha=0.25) +
+         # scale_fill_manual(values=group.colors)+
+          theme_classic()
+        
+        my.plots[[i]]<-p1
+        
+        }
+        return(my.plots)
+      }
+      }
+    
+
+
+```
+
+
+
+##Examining Errors 
+
+
+While model fit statistics and scatter plots of observed and predicted values generally indicate the model fits the data well there are a high number of outliers that can be seen in the predictive p-value plot (0s and 1s). Here we plot the errors (observed yield minus mean predicted yield) in order to identify any trends associated with these outliers. Positive values indicate underestimation of yields and negative values indicate overestimation of yields.
+As shown below the majority of errors fall near 0. High errors do not appear to occur consistently in the same region over time, but do seem to show highly localized clustering that may be indicative of localized extreme natural disaster events not captured in the model. For example overestimation of yields along small sections of the Mississippi, Ohio, and Missouri rivers and along the eastern coastline can be seen in several years corresponding to years with hurricanes (2011) and low river levels induced by severe drought (2012). These suggest that our model is capturing global and regional variability in annual average trends (particularly climate and weather trends), but does not completely account for short-term (sub-annual) localized extreme weather conditions and other hazards (pest outbreak, wildfire, etc...). 
+
+```{r map_errors, echo=F, warning=F, message=F, comment=NA, cache=T}
+
+ df<-st_as_sf(d_corn)
+ df$YIELD<-log(df$YIELD)
+ results<-readRDS(paste0(wd,"/output/","rich_us_corn_ag",".rds"))
+  
+      dat<-cbind(df,results$summary.fitted.values$mean)
+      dat$error<-dat$YIELD-dat$results.summary.fitted.values.mean
+      # ggplot(as.data.frame(dat$error), aes(x=results$cpo$pit)) + geom_histogram() + ggtitle( "Model Predictive Errors")
+      
+      require(viridis)
+      p1 <- ggplot() +
+      geom_sf(data = dat[dat$YEAR == 2010, ], color = "white", size = 0.01, aes(fill = error)) +
+        ggtitle("2010") + 
+        theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank(), plot.margin = unit(c(0,0,0,0), "lines")) + scale_fill_viridis(option = "magma")
+      p2 <- ggplot() +
+      geom_sf(data = dat[dat$YEAR == 2011, ], color = "white", size = 0.01, aes(fill = error)) +
+        ggtitle("2011") +
+        theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank(), plot.margin = unit(c(0,0,0,0), "lines")) + scale_fill_viridis(option = "magma")
+      p3 <- ggplot() +
+      geom_sf(data = dat[dat$YEAR == 2012, ], color = "white", size = 0.01, aes(fill = error)) +
+        ggtitle("2012") +
+        theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank(), plot.margin = unit(c(0,0,0,0), "lines")) + scale_fill_viridis(option = "magma")
+      p4 <- ggplot() +
+      geom_sf(data = dat[dat$YEAR == 2013, ], color = "white", size = 0.01, aes(fill = error)) +
+        ggtitle("2013") +
+        theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank(), plot.margin = unit(c(0,0,0,0), "lines")) + scale_fill_viridis(option = "magma")
+      p5 <- ggplot() +
+      geom_sf(data = dat[dat$YEAR == 2014, ], color = "white", size = 0.01, aes(fill = error)) +
+        ggtitle("2014") +
+        theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank(), plot.margin = unit(c(0,0,0,0), "lines")) + scale_fill_viridis(option = "magma")
+      p6 <- ggplot() +
+      geom_sf(data = dat[dat$YEAR == 2015, ], color = "white", size = 0.01, aes(fill = error)) +
+        ggtitle("2015") +
+        theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank(), plot.margin = unit(c(0,0,0,0), "lines")) + scale_fill_viridis(option = "magma")
+      p7 <- ggplot() +
+      geom_sf(data = dat[dat$YEAR == 2016, ], color = "white", size = 0.05, aes(fill = error)) +
+        ggtitle("2016") +
+        theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank(), plot.margin = unit(c(0,0,0,0), "lines")) + scale_fill_viridis(option = "magma")
+      
+      
+      
+      figure1<-ggarrange(p1, p2, p3,p4,p5,p6,p7,
+                       ncol=3,nrow=3, common.legend = TRUE, legend = "bottom", heights=c(1,1)) #too small 
+      figure1<-annotate_figure(figure1, bottom = text_grob("Error between Observed and Predicted log(Yield)"))
+      figure1
+      
+      
+      
+      
+      
+      
+     # dat<-as.data.frame(results$summary.random$AERCODE.id)
+     # dat2<-as.data.frame(results$summary.random$AERCODE.id2)
+     # yrs<-seq(1:7)
+     # datquad1<-as.data.frame(dat$mean*yrs[1]+dat2$mean*(yrs[1]^2))
+     # colnames(datquad1)<-c("response")
+     # datquad2<-as.data.frame(dat$mean*yrs[2]+dat2$mean*(yrs[2]^2))
+     # colnames(datquad2)<-c("response")
+     # datquad3<-as.data.frame(dat$mean*yrs[3]+dat2$mean*(yrs[3]^2))
+     # colnames(datquad3)<-c("response")
+     # datquad4<-as.data.frame(dat$mean*yrs[4]+dat2$mean*(yrs[4]^2))
+     # colnames(datquad4)<-c("response")
+     # datquad5<-as.data.frame(dat$mean*yrs[5]+dat2$mean*(yrs[5]^2))
+     # colnames(datquad5)<-c("response")
+     # datquad6<-as.data.frame(dat$mean*yrs[6]+dat2$mean*(yrs[6]^2))
+     # colnames(datquad6)<-c("response")
+     # datquad7<-as.data.frame(dat$mean*yrs[7]+dat2$mean*(yrs[7]^2))
+     # colnames(datquad7)<-c("response")
+     # 
+     # datquadfull<-rbind(datquad1,datquad2,datquad3,datquad4,datquad5,datquad6,datquad7)
+     # datquadfull$id<-rep(1:78,times=7)
+     # datquadfull$yr<-rep(1:7,each=78)
+     # 
+     # p<-ggplot(datquadfull[datquadfull$id<10,], aes(x=yr, y=response, color=as.factor(id))) + geom_point()
+     # p
+     
+```
+
+
+##CROSS SECTIONAL MODELS    
+
+Individual cross-sectional models are run  to illustrate how much the results from the panel model are influenced by differences across space and how variable these results are over time. Results for 2010, 2013, and 2016 are shown below. The cross sectional models suggest that much of the diversity effect does arise from differences that occur across space, but that this is also variable across years. For example, there is no significant effect of diversity in 2013, a year of widespread severe drought, while there is a clear effect of diversity in 2016. Generally, the climate variable functional responses appear to be consistent across years with the effect of precipitation being most variable.
+
+```{r corn, echo=F, warning=F, message=F, comment=NA, cache=T}
+
+prep_adjacency2<-function(data, crop){
+
+  df<-data
+  df<-df[,-22]
+##build list of counties growing crop of interest
+   d_crop<-df[df$CROP == crop & !is.na(df$YIELD),] #extract data for crop of interest for location-times when production occured
+    names<-unique(d_crop$GEOID)
+  
+##clip county file to cropproducing areas and setup indexing by CNTY
+  #cnty_dup<-cnty #save a copy of county file for later use
+  cnty<-cnty[cnty$GEOID %in% names,] #subset to cnty growing crop
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_crop<-cnty #save a copy of the crop producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_crop<-left_join(d_crop,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  #d_crop<-d_crop[order(d_crop$CNTY)]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book (Blangiardo, M., & Cameletti, M. (2015). Spatial and spatio-temporal Bayesian models with R-INLA. John Wiley & Sons.) 
+ 
+##Build the relational matrix for areas of interest
+    cnty_crop<-as(cnty_crop,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_crop, queen=F) #create neighbors list from polygon object, neighbors share one or more points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.", crop,"Xs.rds"))
+   
+
+##Add AER index
+  
+  names<-unique(d_crop$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  AER_dup<-AER #save a copy of county file for later use
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  AER_crop<-AER #save a copy of the crop producing counties file for building the relational matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_crop<-rename(d_crop,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_crop<-left_join(d_crop,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_crop<-d_crop[order(d_crop$AERCODE, d_crop$YEAR),]#Ordering dataset by location then time 
+  
+#save crop dataset with indexes
+  saveRDS(d_crop, paste0(wd,"/output/d_", crop,"Xs.rds"))
+}
+
+d_sub<-d_corn[d_corn$YEAR==2010,]
+prep_adjacency2(d_sub,"corn")
+  d_sub<-readRDS(paste0(wd,"/output/d_cornXs.rds"))
+  H.adj.corn<-readRDS(paste0(wd,"/output/","H.adj.cornXs.rds"))
+  #image(inla.graph2matrix(H.adj.corn), xlab="", ylab="")
+  
+d_sub$SDI<-d_sub$SDI_AG
+d_sub$SIDI<-d_sub$SIDI_AG
+d_sub$RICH<-d_sub$RICH_AG
+
+#SDI binned to nearest 0.01
+d_sub$SIDI<-round(d_sub$SIDI,2)
+#SDI binned to nearest 0.1
+d_sub$SDI<-round(d_sub$SDI,1)
+#TP, GDD binned to nearest 100
+d_sub$TP<-round(d_sub$TP,-2)
+d_sub$GDD<-round(d_sub$GDD,-2)
+#SDD binned to nearest 10
+d_sub$SDD<-round(d_sub$SDD,-1)
+#Yield transformed to log(Yield)
+d_sub$YIELD<-log(d_sub$YIELD)
+
+#Additional identifiers
+d_sub$AERCODE.id<-d_sub$AERCODE
+d_sub$YEAR.id<-d_sub$Yr  #so index starts at 1
+d_sub$YEAR.id2<-(d_sub$Yr )^2
+d_sub$AERCODE.id2<-d_sub$AERCODE
+
+
+#setup pc priors
+  # v=sd(d_sub$YIELD,na.rm=TRUE)
+  # n=dim(d_sub)[1]
+  # Q = INLA:::inla.pc.bym.Q(H.adj.corn)
+  # Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))
+  # u = 0.2/0.31
+  # alpha = 0.01
+  # phi.u = 0.5
+  # phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha
+  # phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+     
+           
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.corn, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+          
+          
+         #run.model(formula, d_sub,"corn","rich_us_corn_ag_x10")
+         model.results("rich_us_corn_ag_x10", d_sub,"corn", diagnostics=TRUE)
+        plot.spatialeffect("rich_us_corn_ag_x10", d_sub,"corn")
+        plot.smootheffect("rich_us_corn_ag_x10", var="RICH")
+        plot.smootheffect("rich_us_corn_ag_x10", var="TP")
+        plot.smootheffect("rich_us_corn_ag_x10", var="SDD")
+        plot.smootheffect("rich_us_corn_ag_x10", var="GDD")
+        #crossval.randho("sdi_us_corn_ag_ho", formula, d_sub, "corn", n=1/7)
+
+###########2013###############        
+d_sub<-d_corn[d_corn$YEAR==2013,]
+prep_adjacency2(d_sub,"corn")
+  d_sub<-readRDS(paste0(wd,"/output/d_cornXs.rds"))
+  H.adj.corn<-readRDS(paste0(wd,"/output/","H.adj.cornXs.rds"))
+  #image(inla.graph2matrix(H.adj.corn), xlab="", ylab="")
+  
+
+d_sub$SDI<-d_sub$SDI_AG
+d_sub$SIDI<-d_sub$SIDI_AG
+d_sub$RICH<-d_sub$RICH_AG
+
+#SDI binned to nearest 0.01
+d_sub$SIDI<-round(d_sub$SIDI,2)
+#SDI binned to nearest 0.1
+d_sub$SDI<-round(d_sub$SDI,1)
+#TP, GDD binned to nearest 100
+d_sub$TP<-round(d_sub$TP,-2)
+d_sub$GDD<-round(d_sub$GDD,-2)
+#SDD binned to nearest 10
+d_sub$SDD<-round(d_sub$SDD,-1)
+#Yield transformed to log(Yield)
+d_sub$YIELD<-log(d_sub$YIELD)
+
+#Additional identifiers
+d_sub$AERCODE.id<-d_sub$AERCODE
+d_sub$YEAR.id<-d_sub$Yr  #so index starts at 1
+d_sub$YEAR.id2<-(d_sub$Yr )^2
+d_sub$AERCODE.id2<-d_sub$AERCODE
+
+#setup pc priors
+  # v=sd(d_sub$YIELD,na.rm=TRUE)
+  # n=dim(d_sub)[1]
+  # Q = INLA:::inla.pc.bym.Q(H.adj.corn)
+  # Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))
+  # u = 0.2/0.31
+  # alpha = 0.01
+  # phi.u = 0.5
+  # phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha
+  # phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+   
+           
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.corn, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+          
+          
+         #run.model(formula, d_sub,"corn","rich_us_corn_ag_x13")
+         model.results("rich_us_corn_ag_x13", d_sub,"corn", diagnostics=TRUE)
+        plot.spatialeffect("rich_us_corn_ag_x13", d_sub,"corn")
+        plot.smootheffect("rich_us_corn_ag_x13", var="RICH")
+        plot.smootheffect("rich_us_corn_ag_x13", var="TP")
+        plot.smootheffect("rich_us_corn_ag_x13", var="SDD")
+        plot.smootheffect("rich_us_corn_ag_x13", var="GDD")
+        #crossval.randho("sdi_us_corn_ag_ho", formula, d_sub, "corn", n=1/7)
+
+###########2013###############          
+d_sub<-d_corn[d_corn$YEAR==2016,]
+        
+  prep_adjacency2(d_sub,"corn")
+  d_sub<-readRDS(paste0(wd,"/output/d_cornXs.rds"))
+  H.adj.corn<-readRDS(paste0(wd,"/output/","H.adj.cornXs.rds"))
+  #image(inla.graph2matrix(H.adj.corn), xlab="", ylab="")
+  
+d_sub$SDI<-d_sub$SDI_AG
+d_sub$SIDI<-d_sub$SIDI_AG
+d_sub$RICH<-d_sub$RICH_AG
+
+#SDI binned to nearest 0.01
+d_sub$SIDI<-round(d_sub$SIDI,2)
+#SDI binned to nearest 0.1
+d_sub$SDI<-round(d_sub$SDI,1)
+#TP, GDD binned to nearest 100
+d_sub$TP<-round(d_sub$TP,-2)
+d_sub$GDD<-round(d_sub$GDD,-2)
+#SDD binned to nearest 10
+d_sub$SDD<-round(d_sub$SDD,-1)
+#Yield transformed to log(Yield)
+d_sub$YIELD<-log(d_sub$YIELD)
+
+#Additional identifiers
+d_sub$AERCODE.id<-d_sub$AERCODE
+d_sub$YEAR.id<-d_sub$Yr  #so index starts at 1
+d_sub$YEAR.id2<-(d_sub$Yr )^2
+d_sub$AERCODE.id2<-d_sub$AERCODE
+
+#setup pc priors
+  # v=sd(d_sub$YIELD,na.rm=TRUE)
+  # n=dim(d_sub)[1]
+  # Q = INLA:::inla.pc.bym.Q(H.adj.corn)
+  # Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))
+  # u = 0.2/0.31
+  # alpha = 0.01
+  # phi.u = 0.5
+  # phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha
+  # phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+      
+           
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.corn, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+          
+          
+         #run.model(formula, d_sub,"corn","rich_us_corn_ag_x16")
+         model.results("rich_us_corn_ag_x16", d_sub,"corn", diagnostics=TRUE)
+        plot.spatialeffect("rich_us_corn_ag_x16", d_sub,"corn")
+        plot.smootheffect("rich_us_corn_ag_x16", var="RICH")
+        plot.smootheffect("rich_us_corn_ag_x16", var="TP")
+        plot.smootheffect("rich_us_corn_ag_x16", var="SDD")
+        plot.smootheffect("rich_us_corn_ag_x16", var="GDD")
+        #crossval.randho("sdi_us_corn_ag_ho", formula, d_sub, "corn", n=1/7)
+          
+```
+
+  
+
+##Sensitivity to Controls
+
+The next set of three models tests the stability of our results given exclusion or inclusion of the linear controls. If the results are stable we can be assured that any ommitted variables are not correlated with those variables.
+
+#MODEL without PERC_IRR
+
+This model removes the percent irrigated area control. The functional response for diversity shifts to show more pronounced effects (greater increasing slope) on yield when the irrigation control is removed. This may indicate that there may be ommitted variables that are related to irrigation, and suggests that incomplete consideration of water access may lead to incorrect attribution of effects to diversity. Note, however that the shift in the response is not statistically significant (the 95% credibility bands overlap with the primary model). In addition, the precipitation response curve shifts slightly for low values of TP (this shift is not statistically significant).
+
+```{r no_percirr, echo=F, warning=F, message=F, comment=NA, cache=T}
+
+
+
+
+# d_corn<-readRDS(paste0(wd,"/output/d_corn.rds"))  
+# 
+# d_corn$SDI<-d_corn$SDI_AG
+# d_corn$SIDI<-d_corn$SIDI_AG
+# d_corn$RICH<-d_corn$RICH_AG
+# 
+# #SDI binned to nearest 0.01
+# d_corn$SIDI<-round(d_corn$SIDI,2)
+# #SDI binned to nearest 0.1
+# d_corn$SDI<-round(d_corn$SDI,1)
+# #TP, GDD binned to nearest 100
+# d_corn$TP<-round(d_corn$TP,-2)
+# d_corn$GDD<-round(d_corn$GDD,-2)
+# #SDD binned to nearest 10
+# d_corn$SDD<-round(d_corn$SDD,-1)
+# #Yield transformed to log(Yield)
+# d_corn$YIELD<-log(d_corn$YIELD)
+# 
+# #Additional identifiers
+# d_corn$AERCODE.id<-d_corn$AERCODE
+# d_corn$YEAR.id<-d_corn$Yr  #so index starts at 1
+# d_corn$YEAR.id2<-(d_corn$Yr )^2
+# d_corn$AERCODE.id2<-d_corn$AERCODE
+# 
+# 
+# #setup pc priors
+#   v=sd(d_corn$YIELD,na.rm=TRUE)
+#   n=dim(d_corn)[1]
+#   Q = INLA:::inla.pc.bym.Q(H.adj.corn)
+#   Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))
+#   u = 0.2/0.31
+#   alpha = 0.01
+#   phi.u = 0.5
+#   phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha
+#   phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+     
+           
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.corn, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+          
+          
+         #run.model(formula, d_corn,"corn","rich_us_corn_ag_r1")
+         model.results("rich_us_corn_ag_r1", d_corn,"corn", diagnostics=TRUE)
+        plot.spatialeffect("rich_us_corn_ag_r1", d_corn,"corn")
+        plot.smootheffect("rich_us_corn_ag_r1", var="RICH")
+        plot.smootheffect("rich_us_corn_ag_r1", var="TP")
+        plot.smootheffect("rich_us_corn_ag_r1", var="SDD")
+        plot.smootheffect("rich_us_corn_ag_r1", var="GDD")
+        #crossval.randho("sdi_us_corn_ag_ho", formula, d_corn, "corn", n=1/7)
+
+```
+
+
+#MODEL without ACRES
+
+This model removes the cultivated acres control.The diversity functional response is not effected by the inclusion/exclusion of the control for agricultural dominance.
+
+```{r no_acres, echo=F, warning=F, message=F, comment=NA, cache=T}
+
+# d_corn<-readRDS(paste0(wd,"/output/d_corn.rds"))  
+# 
+# d_corn$SDI<-d_corn$SDI_AG
+# d_corn$SIDI<-d_corn$SIDI_AG
+# d_corn$RICH<-d_corn$RICH_AG
+# 
+# #SDI binned to nearest 0.01
+# d_corn$SIDI<-round(d_corn$SIDI,2)
+# #SDI binned to nearest 0.1
+# d_corn$SDI<-round(d_corn$SDI,1)
+# #TP, GDD binned to nearest 100
+# d_corn$TP<-round(d_corn$TP,-2)
+# d_corn$GDD<-round(d_corn$GDD,-2)
+# #SDD binned to nearest 10
+# d_corn$SDD<-round(d_corn$SDD,-1)
+# #Yield transformed to log(Yield)
+# d_corn$YIELD<-log(d_corn$YIELD)
+# 
+# #Additional identifiers
+# d_corn$AERCODE.id<-d_corn$AERCODE
+# d_corn$YEAR.id<-d_corn$Yr  #so index starts at 1
+# d_corn$YEAR.id2<-(d_corn$Yr )^2
+# d_corn$AERCODE.id2<-d_corn$AERCODE
+# 
+# 
+# #setup pc priors
+#   v=sd(d_corn$YIELD,na.rm=TRUE)
+#   n=dim(d_corn)[1]
+#   Q = INLA:::inla.pc.bym.Q(H.adj.corn)
+#   Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))
+#   u = 0.2/0.31
+#   alpha = 0.01
+#   phi.u = 0.5
+#   phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha
+#   phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+     
+           
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + PERC_IRR  + 
+  f(CNTY, model="bym2", graph=H.adj.corn, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+          
+          
+         #run.model(formula, d_corn,"corn","rich_us_corn_ag_r2")
+         model.results("rich_us_corn_ag_r2", d_corn,"corn", diagnostics=TRUE)
+        plot.spatialeffect("rich_us_corn_ag_r2", d_corn,"corn")
+        plot.smootheffect("rich_us_corn_ag_r2", var="RICH")
+        plot.smootheffect("rich_us_corn_ag_r2", var="TP")
+        plot.smootheffect("rich_us_corn_ag_r2", var="SDD")
+        plot.smootheffect("rich_us_corn_ag_r2", var="GDD")
+        #crossval.randho("sdi_us_corn_ag_ho", formula, d_corn, "corn", n=1/7)
+
+```
+
+
+#MODEL without ACRES and PERC_IRR
+
+This model removes the cultivated acres control and the percent irrigated area control. Results are similar to those seen for the model without PERC_IRR.
+
+```{r no_acres_percirr, echo=F, warning=F, message=F, comment=NA, cache=T}
+# 
+# d_corn<-readRDS(paste0(wd,"/output/d_corn.rds"))
+# 
+# d_corn$SDI<-d_corn$SDI_AG
+# d_corn$SIDI<-d_corn$SIDI_AG
+# d_corn$RICH<-d_corn$RICH_AG
+# 
+# #SDI binned to nearest 0.01
+# d_corn$SIDI<-round(d_corn$SIDI,2)
+# #SDI binned to nearest 0.1
+# d_corn$SDI<-round(d_corn$SDI,1)
+# #TP, GDD binned to nearest 100
+# d_corn$TP<-round(d_corn$TP,-2)
+# d_corn$GDD<-round(d_corn$GDD,-2)
+# #SDD binned to nearest 10
+# d_corn$SDD<-round(d_corn$SDD,-1)
+# #Yield transformed to log(Yield)
+# d_corn$YIELD<-log(d_corn$YIELD)
+# 
+# #Additional identifiers
+# d_corn$AERCODE.id<-d_corn$AERCODE
+# d_corn$YEAR.id<-d_corn$Yr  #so index starts at 1
+# d_corn$YEAR.id2<-(d_corn$Yr )^2
+# d_corn$AERCODE.id2<-d_corn$AERCODE
+# 
+# 
+# #setup pc priors
+#   v=sd(d_corn$YIELD,na.rm=TRUE)
+#   n=dim(d_corn)[1]
+#   Q = INLA:::inla.pc.bym.Q(H.adj.corn)
+#   Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))
+#   u = 0.2/0.31
+#   alpha = 0.01
+#   phi.u = 0.5
+#   phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha
+#   phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+# 
+
+     
+           
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(CNTY, model="bym2", graph=H.adj.corn, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+          
+          
+        # run.model(formula, d_corn,"corn","rich_us_corn_ag_r3")
+         #model.results("rich_us_corn_ag_r3", d_corn,"corn", diagnostics=TRUE)
+        plot.spatialeffect("rich_us_corn_ag_r3", d_corn,"corn")
+        plot.smootheffect("rich_us_corn_ag_r3", var="RICH")
+        plot.smootheffect("rich_us_corn_ag_r3", var="TP")
+        plot.smootheffect("rich_us_corn_ag_r3", var="SDD")
+        plot.smootheffect("rich_us_corn_ag_r3", var="GDD")
+        #crossval.randho("sdi_us_corn_ag_ho", formula, d_corn, "corn", n=1/7)
+
+```
+
+##FUNCTIONAL RESPONSE CONSISTENCY CHECKS
+
+
+The next set of results shows the output from very simple models with only the predictor variables of interest to see if we identify the same types of relationships as seen in the full model. The goal here is to determine if the shape of the functional responses in the full model are generally stable and hence likely not the result of confounding or misidentification.
+
+#MODEL with only SDI
+
+```{r SDI, echo=F, warning=F, message=F, comment=NA, cache=T}
+#setup pc priors
+   v=sd(d_corn$YIELD,na.rm=TRUE)
+
+           
+          formula<-YIELD ~  1 +   f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  
+  
+
+
+
+##CORN
+        
+        #run.model(formula, d_corn,"corn","sdionly_corn")
+        plot.smootheffect("sdionly_corn", var="RICH")
+       
+        
+```
+
+#MODEL with only TP
+
+```{r TP, echo=F, warning=F, message=F, comment=NA, cache=T}
+
+v=sd(d_corn$YIELD,na.rm=TRUE)
+
+
+          formula<-YIELD ~  1 +   f(TP, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  
+  
+
+##CORN
+        
+         # run.model(formula, d_corn,"corn","tponly_corn")
+        
+        plot.smootheffect("tponly_corn", var="TP")
+        
+        
+```
+
+
+#MODEL with only SDD
+
+```{r SDD, echo=F, warning=F, message=F, comment=NA, cache=T}
+
+
+v=sd(d_corn$YIELD,na.rm=TRUE)
+
+
+          formula<-YIELD ~  1 +   f(SDD, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  
+
+##CORN
+        
+         # run.model(formula, d_corn,"corn","sddonly_corn")
+        
+        
+        plot.smootheffect("sddonly_corn", var="SDD")
+       
+        
+```
+
+#MODEL with only GDD
+
+```{r GDD, echo=F, warning=F, message=F, comment=NA, cache=T}
+
+
+v=sd(d_corn$YIELD,na.rm=TRUE)
+
+
+          formula<-YIELD ~  1 +   f(GDD, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  
+
+##CORN
+        
+         # run.model(formula, d_corn,"corn","gddonly_corn")
+        
+        plot.smootheffect("gddonly_corn", var="GDD")
+        
+```
+
+##Bayesian Prior Sensitivity Checks
+
+This final set of models examines the sensitivity of the model results to choice of Bayesian prior. 
+
+#Model with Default Priors
+
+ Employs the default, generally uninformative priors assigned by R-INLA. Scale-model is TRUE for all random walk and BYM effects. This model provides results very similar to the primary model reported. Minor differences in the functional response curves for RICH and GDD. Precision estimates for random walk variables slightly higher than in the primary model. 
+```{r BP1, echo=F, warning=F, message=F, comment=NA, cache=T}
+ 
+
+              #reduction of 1 magnitude of prec
+
+formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T) + f(SDD,model="rw1",scale.model=T)  + f(GDD,model="rw1", scale.model=T) + 
+  f(RICH, model="rw1",scale.model=T) + PERC_IRR + ACRES   + f(CNTY, model="bym2", graph=H.adj.corn, scale.model=TRUE) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+
+           # OUT<-inla(formula, data=d_corn, family = "gaussian", control.predictor = list( compute=TRUE),
+                   #     control.compute=list(dic=TRUE, cpo=TRUE))
+           # saveRDS(OUT,paste0(wd,"/output/OUT.rds"))
+              plot.spatialeffect("OUT", d_corn,"corn")
+              plot.smootheffect("OUT", var="RICH")
+              plot.smootheffect("OUT", var="TP")
+              plot.smootheffect("OUT", var="SDD")
+              plot.smootheffect("OUT", var="GDD")
+              model.results("OUT", d_corn,"corn", diagnostics=TRUE)
+
+```
+
+#Reduced Precision Fixed Effect Prior
+
+ Employs the default, generally uninformative priors assigned by R-INLA for random effects. Scale-model is TRUE for all random walk and BYM effects. The fixed effect is given a reduced precision (more uniformative) prior.Results are not significntly differenct from the preceding model and are again consistent with the primary model reported.
+ 
+```{r BP2, echo=F, warning=F, message=F, comment=NA, cache=T}
+ 
+
+              #reduction of 1 magnitude of prec
+
+formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T) + f(SDD,model="rw1",scale.model=T)  + f(GDD,model="rw1", scale.model=T) + f(RICH, model="rw1", scale.model=T) + PERC_IRR + ACRES   + f(CNTY, model="bym2", graph=H.adj.corn, scale.model=TRUE) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+
+            # OUT<-inla(formula, data=d_corn, family = "gaussian", control.predictor = list( compute=TRUE),
+            #             control.compute=list(dic=TRUE, cpo=TRUE), control.fixed = list(prec = 0.00000001))
+            # saveRDS(OUT,paste0(wd,"/output/OUT2.rds"))
+              plot.spatialeffect("OUT2", d_corn,"corn")
+              plot.smootheffect("OUT2", var="RICH")
+              plot.smootheffect("OUT2", var="TP")
+              plot.smootheffect("OUT2", var="SDD")
+              plot.smootheffect("OUT2", var="GDD")
+              model.results("OUT2", d_corn,"corn", diagnostics=TRUE)
+
+```
+
+#Penalized Complexity Prior for Spatial Effects
+
+Employs the default settings assigned by R-INLA for a penalized complexity BYM prior. Scale-model is TRUE for all random walk and BYM effects. The fixed effect is given the reduced precision (more uniformative) prior. Results similar to preceding models and consistent with the primary model. Precision for spatial effects slightly higher than in preceding models.
+ 
+```{r BP3, echo=F, warning=F, message=F, comment=NA, cache=T}               
+#penalised complexity prior for bym
+n=dim(d_corn)[1]
+Q = INLA:::inla.pc.bym.Q(H.adj.corn)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+        formula<-YIELD ~ 1 + f(TP, model="rw1",scale.model=T) + f(SDD,model="rw1",scale.model=T)  + f(GDD,model="rw1", scale.model=T) +
+  f(RICH, model="rw1", scale.model=T)+ PERC_IRR + ACRES  + f(CNTY, model="bym2", graph=H.adj.corn, scale.model=TRUE, constr = TRUE,
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3),
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+
+              # OUT<-inla(formula, data=d_corn, family = "gaussian", control.predictor = list( compute=TRUE),
+              #           control.compute=list(dic=TRUE, cpo=TRUE), control.fixed = list(prec = 0.00000001)) 
+              # saveRDS(OUT,paste0(wd,"/output/OUT3.rds"))
+             plot.spatialeffect("OUT3", d_corn,"corn")
+              plot.smootheffect("OUT3", var="RICH")
+              plot.smootheffect("OUT3", var="TP")
+              plot.smootheffect("OUT3", var="SDD")
+              plot.smootheffect("OUT3", var="GDD")
+              model.results("OUT3", d_corn,"corn", diagnostics=TRUE) #no noticeable difference
+              
+
+```
+
+#Penalized Complexity Prior for Random Walk Effects
+
+Employs the default settings assigned by R-INLA for a random walk (order 1) prior (employs standard deviation of the dependent variable as a scaling factor). Scale-model is TRUE for all random walk and BYM effects. The fixed effect is given the reduced precision (more uniformative) prior.Results are not signficantly different from primary model reported.
+
+```{r BP4, echo=F, warning=F, message=F, comment=NA, cache=T}   
+# pc prior on rw1
+u=sd(d_corn$YIELD,na.rm=TRUE)
+
+              formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(u,0.01)))) + f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(u,0.01))))  + f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(u,0.01)))) +
+  f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(u,0.01)))) + PERC_IRR + ACRES   + f(CNTY, model="bym", graph=H.adj.corn, scale.model=TRUE, constr = TRUE) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+
+              # OUT<-inla(formula, data=d_corn, family = "gaussian", control.predictor = list( compute=TRUE),
+              #           control.compute=list(dic=TRUE, cpo=TRUE), control.fixed = list(prec = 0.00000001))
+              # saveRDS(OUT,paste0(wd,"/output/OUT4.rds"))
+              plot.spatialeffect("OUT4", d_corn,"corn")
+              plot.smootheffect("OUT4", var="RICH")
+              plot.smootheffect("OUT4", var="TP")
+              plot.smootheffect("OUT4", var="SDD")
+              plot.smootheffect("OUT4", var="GDD")
+              model.results("OUT4", d_corn,"corn", diagnostics=TRUE) #no noticeable difference
+```
+
+ 

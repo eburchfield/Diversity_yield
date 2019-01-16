@@ -1,0 +1,2332 @@
+---
+title: 'The  impact of agricultural diversification on U.S. crop production: Regional Models Estimation and Diagnostics'
+author: "Kate Nelson"
+date: "12/15/2018"
+output: html_document
+---
+
+This file contains regional models examining the functional relationship between agricultural landscape diversity and agricultural yields. This work applies hierachical Bayesian spatiotemporal modeling techniques to estimation of the effect of diversity of the agricultural landscape on the yield of corn, soy, and winter wheat. 
+
+```{r setup, include=FALSE, cache=T}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(comment = NA)
+library(ggplot2)
+library(dplyr)
+library(sf)
+library (INLA)
+library(raster)
+library(sp)
+library(spdep)
+library(rgeos)
+library(ggpubr)
+library(knitr)
+
+```
+
+
+
+```{r define_fcns, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+## DEFINE FUNCTIONS
+
+# Setup some basic functions to run models and provide model results, diagnostics, and plots. 
+
+run.model<-function(formula, data, crop, name){
+  df<-data[data$CROP %in% crop,] #define the dataset for the crop of interest
+  #y<-df$YIELD #specify the dependent variable
+  OUT<-inla(formula, data=df, family = "gaussian",     
+          control.predictor = list( compute=TRUE), control.compute=list(dic=TRUE, cpo=TRUE), control.fixed = list(prec = 0.0000001)) #run the inla model
+  saveRDS(OUT, file=paste0(wd,"/output/",name ,".rds")) #save the model output
+}
+
+model.results<-function(model_results_name, data="d", crop="corn", diagnostics = TRUE){
+  results<-readRDS(paste0(wd,"/output/",model_results_name,".rds"))
+  data<-data[data$CROP %in% crop,] #subset data by crop of interest
+  data<-as.data.frame(data)
+  summary<-summary(results)
+  if (diagnostics == TRUE){ #if diagnostics turned on return the dic, cpo, and pit
+    #R_INLA Diagnostics
+    DIC<-(results$dic$dic)
+    CPO<-(sum(log(results$cpo$cpo), na.rm=T)) 
+    h<-ggplot(as.data.frame(results$cpo$pit), aes(x=results$cpo$pit)) + geom_histogram() + ggtitle( "Model PIT")
+    #PPC Distribution Checks
+    p_val<-c()
+    n<-length(data$YIELD)
+    for(i in (1:n)){
+      p_val[i]<-inla.pmarginal(q=data$YIELD[i],
+                               marginal=results$marginals.fitted.values[[i]])
+    }
+    data<-cbind(data,results$summary.fitted.values$mean)
+    colnames(data)[dim(data)[2]]<-c("FittedVals")
+    dat<-select_at(data, c("YIELD","FittedVals")) %>% mutate_all(.,funs(exp))
+     p1<-ggplot(as.data.frame(dat[!is.na(dat$YIELD),]), aes(x=YIELD,y=FittedVals)) + geom_point(size=0.2, color="blue") +
+      ggtitle("Scatter Plot of Predicted and Observed Values")  + xlab("Observed Value") + ylab("Mean of Post. Pred. Distr.")
+  
+    p2<-ggplot(as.data.frame(p_val), aes(x=p_val)) + geom_histogram() + ggtitle("Posterior Predictive p-values")
+    
+    #PPC Summary Metrics
+    sq_dif<-(data$YIELD-data$FittedVals)^2
+    MSE<-1/n*(sum(sq_dif,na.rm=T))
+    
+    pred_res2<-(data$FittedVals[!is.na(data$YIELD)] - mean(data$YIELD, na.rm=T)) ^2
+    obs_res2<-(data$YIELD[!is.na(data$YIELD)] - mean(data$YIELD, na.rm=T))^2
+    R2<-sum(pred_res2, na.rm=T)/sum(obs_res2, na.rm=T)
+    
+    #OUPUTS
+    summtable<-as.data.frame(summary$fixed[,1:5])
+    summtable.pt2<-as.data.frame(summary$hyperpar[,1:5])
+    summtable<-rbind(summtable,summtable.pt2)
+    summtable<-kable(summtable, caption="Summary Table of Model Estimates")
+    
+    Diagnostics<-as.data.frame(t(c(DIC,CPO,MSE,R2)))
+    colnames(Diagnostics)<-c("DIC","CPO","MSE","R2")
+    Diagnostics<-kable(Diagnostics, caption="Model Diagnostic Metrics")
+    
+    figure<-ggarrange(h,p1,p2,ncol=3,nrow=1)
+    annotate_figure(figure, top= text_grob("Model Diagnostic Plots"))
+    
+    my_list<-list(summtable,  figure, Diagnostics)
+  return(my_list)
+  }  
+  my_list<-list(summary)
+  return(my_list)
+}
+
+
+crossval.randho<-function(model_results_name, formula= "formula", data="d", crop="corn", n=1/7){
+#using a completely random hold-out sample works better than holding out an entire year as we retain enough info to have reliable random effects
+d_ho<-data
+
+#select random subset to withhold from evaluation if you have not already done so
+if (!file.exists(paste0(wd,"/output/hoidx_",model_results_name,".rds"))){ 
+     idx<-sample(seq(1:length(d_ho$YIELD)), length(d_ho$YIELD)*n) #1/7 sample
+    saveRDS(idx,paste0(wd,"/output/hoidx_",model_results_name,".rds"))}
+
+idx<-readRDS(paste0(wd,"/output/hoidx_",model_results_name,".rds"))
+
+#build the subset for evaluation
+d_ho$YIELD[idx]<-NA
+
+if (!file.exists(paste0(wd,"/output/",model_results_name,".rds"))){ 
+      run.model(formula, d_ho,crop,model_results_name)
+}
+
+      df<-st_as_sf(data)
+      results<-readRDS(paste0(wd,"/output/",model_results_name,".rds"))
+  
+      df<-cbind(df,results$summary.fitted.values$mean)
+      df$error<-df$YIELD-df$results.summary.fitted.values.mean
+      #hist(data$error)
+      
+      #MSE and R2 for held-out sample 
+     df_sub<-df[idx,]
+     n<-length(df_sub$YIELD)
+     df_sub<-df_sub[df_sub$error<10,]
+     cnt_outliers<-length(df_sub[df_sub$error<10,1])#i remove two outliers that doubles the predicted residuals, upon examination the extremely low predicted yield (close to zero after back transformed seems to be due in part to discrepant TP values 
+  
+     
+    sq_dif<-(df_sub$error)^2
+    MSE<-1/n*(sum(sq_dif,na.rm=T))
+    
+    pred_res2<-(df_sub$results.summary.fitted.values.mean [!is.na(df_sub$YIELD)] - mean(df_sub$YIELD, na.rm=T)) ^2
+    obs_res2<-(df_sub$YIELD[!is.na(df_sub$YIELD)] - mean(df_sub$YIELD, na.rm=T))^2
+    R2<-sum(pred_res2, na.rm=T)/sum(obs_res2, na.rm=T)
+    Gelman_R2<-(sum(pred_res2)/(sum(pred_res2)+sum(sq_dif)))
+    NSE<-1-(sum(sq_dif,na.rm=T)/sum(obs_res2, na.rm=T))
+    
+    Cross_Val_Metrics<-as.data.frame(t(c(R2,MSE,NSE, cnt_outliers)))
+    colnames(Cross_Val_Metrics)<-c("R2","MSE","NSE","OutlierCount")
+    saveRDS(Cross_Val_Metrics, paste0(wd,"/output/cv_",model_results_name,".rds"))
+    Cross_Val_Metrics<-kable(Cross_Val_Metrics, caption="Cross Validation Diagnostic Metrics")
+    
+    return(Cross_Val_Metrics)
+}
+
+
+plot.spatialeffect<-function(model_results_name, data, crop, type ="BYM", scale="CNTY"){
+  df<-data[data$CROP %in% crop,] #subset data by crop of interest
+  df<-st_as_sf(df)
+  results<-readRDS(paste0(wd,"/output/",model_results_name,".rds"))
+  
+  if (type =="BYM"){ #Spatial effect for bym models
+    if (scale =="CNTY"){ #County spatial effects
+      Nareas<-length(unique(df$CNTY)) #number of unique spatial locations in dataset
+      asr<-results$summary.random$CNTY[1:Nareas,c(1,2,3)]#extract the area-specific residuals
+    
+      #Create spatial dataframe with information for map 
+      map.asr<-left_join(df[,c("CNTY","GEOID","geometry")],asr,by=c("CNTY"="ID"))
+      #map.asr<-map.asr[,c(-1)]
+      colnames(map.asr)<-c("CNTY","GEOID","Mean","Standard_Deviation","geometry")
+            #plot(map.asr, main= "Area Specific Residuals"
+      saveRDS(map.asr,paste0(wd,"/output/",model_results_name,"_asr.rds"))
+     
+     #calculate spatially structured variance if using BYM
+          # mat.marg <-matrix(NA, nrow=Nareas,ncol=100000)
+          # m<-results$marginals.random$CNTY
+          # for (i in 1:Nareas){
+          #   u<- m[[Nareas+i]]
+          #   mat.marg[i,]<-inla.rmarginal(100000,u)
+          # }
+          # var.u<-apply(mat.marg,2,var)
+          # 
+          # 
+          # #fraction of area effect that is iid structured
+          # var.v<-inla.rmarginal(100000,inla.tmarginal (function(x) 1/x, results$marginals.hyperpar$`Precision for CNTY (iid component)`)) 
+          #   #var.u<-inla.rmarginal(100000,inla.tmarginal (function(x) 1/x, results$marginals.hyperpar$`Precision for CNTY (spatial component)`)) #using this                   gives nearly the same results as the rmarginal approach
+          # 
+          # 
+          # #compute spatial fraction of variance
+          # perc.var.u<-mean(var.u/(var.u+var.v))
+      
+    #Report proportion of variance that is spatially structured if using BYM2
+      perc.var.u<-round(results$summary.hyperpar["Phi for CNTY","0.5quant"], digits=4) 
+     
+  #Plot spatial effects 
+     require(viridis)
+      p1 <- ggplot() +
+      geom_sf(data = map.asr, color = "white", size = 0.05, aes(fill = Mean)) +
+        ggtitle(paste("Mean of Area Specific Residuals for", model_results_name)) +
+        theme_minimal() + scale_fill_viridis(option = "magma")
+      p1<-annotate_figure(p1, bottom = text_grob(paste0("Fraction of variance that is spatially structured:", perc.var.u)))
+        
+        
+      # p1<-plot(map.asr[,3], main= paste("Mean of Area Specific Residuals for", model_results_name), lwd=0.5, key.pos=1)
+      #          mtext(paste0("Fraction of variance that is spatially structured:", perc.var.u), side=1) 
+      # p1<-print(p1)
+      
+      p2 <- ggplot() +
+        ggtitle(paste0("Standard Deviation of Area Specific Residuals for", model_results_name)) +
+      geom_sf(data = map.asr, color = "white", size = 0.05, aes(fill = Standard_Deviation)) +
+        theme_minimal() + scale_fill_viridis(option = "magma")
+      
+      # p2<-plot(map.asr[,4], main=paste("Standard Deviation of Area Specific Residuals for", model_results_name), lwd=0.5, key.pos=1)
+      # p2<-print(p2)
+      
+      #my_list<-list(p1,p2,"Fraction of Area Residuals that is Spatially Structured", perc.var.u)
+      my_list<-list(p1,p2)
+      
+      return (my_list)
+    }
+    
+     
+  }
+    
+}
+
+
+
+plot.smootheffect<-function(model_results_name, var="SDI"){
+  
+   results<-readRDS(paste0(wd,"/output/",model_results_name,".rds"))
+   
+   if(var=="SDI"){
+        
+        p2<-ggplot(data=results$summary.random$SDI[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+   }
+   
+   if(var=="SIDI"){
+        
+        p2<-ggplot(data=results$summary.random$SIDI[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+   }
+     if(var=="RICH"){
+        
+        p2<-ggplot(data=results$summary.random$RICH[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+   }
+   if(var=="TP"){
+     
+        p2<-ggplot(data=results$summary.random$TP[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))  
+
+   }
+   if(var=="EfP"){
+       
+        p2<-ggplot(data=results$summary.random$EfP[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))  
+
+   }
+     if(var=="ExP"){
+       
+        p2<-ggplot(data=results$summary.random$ExP[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+     }
+     if(var=="GDD"){
+       
+        p2<-ggplot(data=results$summary.random$GDD[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+     }
+     if(var=="SDD"){
+       
+        p2<-ggplot(data=results$summary.random$SDD[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2)) 
+   
+     }
+    if(var=="Yr"){
+       
+        p2<-ggplot(data=results$summary.random$Yr[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2)) 
+     
+   }
+  
+  
+}
+
+plot.us<-function(directory, metrics, crops, landscape, climatevars, subplot.labels, y.min, y.max, x.min, x.max){
+      
+      metrics.labels<-toupper(metrics)
+      crops.labels<-crops
+      crops.labels[crops.labels == "wwheat"] <- "Winter wheat" 
+      crops.labels[crops.labels == "corn"] <- "Corn" 
+      crops.labels[crops.labels == "soy"] <- "Soy"
+      
+      n<-length(climatevars)
+      registerDoParallel(n)
+      my.plots<-c()
+      getDoParWorkers() 
+      
+      foreach(j=1:n, .packages="ggplot2") %dopar% {
+      my.plots<-c()
+      
+      for (i in 1:length(metrics)){
+        
+        #pull the model output by metric for ag diversity
+        results_1<-readRDS(paste0(directory , metrics[i], "_us_", crops[1], "_", landscape,".rds"))
+        results_2<-readRDS(paste0(directory , metrics[i], "_us_", crops[2], "_",landscape,".rds"))
+        results_3<-readRDS(paste0(directory , metrics[i], "_us_", crops[3], "_",landscape,".rds"))
+        
+        
+        #pull the results for the effect of the metric
+        results_1a<-get(climatevars[j],results_1$summary.random)[ ,c(1,4,5,6)]
+        results_2a<-get(climatevars[j],results_2$summary.random)[ ,c(1,4,5,6)]
+        results_3a<-get(climatevars[j],results_3$summary.random)[ ,c(1,4,5,6)]
+        
+        #add crop column
+        results_1a$Crop<-crops.labels[1]
+        results_2a$Crop<-crops.labels[2]
+        results_3a$Crop<-crops.labels[3]
+        
+        #combine data for a single plot
+        results_tot<-as.data.frame(rbind(results_1a,results_2a,results_3a))
+        results_tot$ClimateVars<-climatevars[j]
+        
+        #build a plot
+        #group.colors<-c("corn" ="#F8766D","soy" ="#00BA38", "winter wheat" ="#619CFF")
+        p1<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Crop, col=Crop), size=1) + 
+         # scale_colour_manual(values=group.colors)+
+          xlim(x.min[j], x.max[j]) + ylim(y.min[j],y.max[j]) + 
+          xlab(paste0(climatevars[j])) + ylab("Effect on log(Yield)") + ggtitle (metrics.labels[i]) +
+          geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Crop, fill=Crop), alpha=0.25) +
+         # scale_fill_manual(values=group.colors)+
+          theme_classic()
+        
+        my.plots[[i]]<-p1
+        
+        }
+        return(my.plots)
+      }
+      }
+    
+
+
+```
+
+
+##REPRESENTING SPACE 
+The yield data available is at a county scale and the distribution of yields across spcae exhibits strong autocorrelation where yields in neighboring counties are more alike than yields in distant counties. This spatial autocorrelation is accounted for using a standard Conditional Autoreggressive  dependency model based on adjacency for all counties in the conterminous US. In order to account for additional county-specific factors that contribute to yields a county iid random effect term is also included, yielding a Besag-York-Mollie (BYM) spatial dependency model. A  seperate county adjacency matrix for each region-crop combination is created.
+
+
+##REGIONAL CORN MODELS
+```{r reg_data, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+
+wd<-getwd()
+
+    cnty<-readRDS(paste0(wd,"/county.RDS"))
+    projection<-cnty@proj4string@projargs
+    cnty<-st_as_sf(cnty)
+    cnty<-cnty[,c(5,11)] 
+    cnty_dup<-cnty #save  a copy
+    
+    AER<-readRDS(paste0(wd,"/us_eco_l3.rds"))
+    AER<-st_as_sf(AER)
+    AER<-st_transform(AER,projection)
+    AER$AERCODE<-seq(1:length(AER$US_L3CODE))
+    AER<-AER[,"AERCODE"]
+    AER_dup<-AER
+    
+    d<-readRDS(paste0(wd, "/fullpanelnew_reg.rds"))
+    
+```
+
+
+
+```{r c_adjacency_mw, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+##CORN COUNTY ADJACENCY FOR MIDWEST
+#build list of counties growing corn
+  d_mw<-d[d$NAME == "Midwest",]
+   d_corn_mw<-d_mw[d_mw$CROP == "corn" & !is.na(d_mw$YIELD),] #extract data for crop of interest for location-times when production occured
+  names<-unique(d_corn_mw$GEOID)
+  
+ #clip county file to corn producing areas and setup indexing by CNTY
+  cnty<-cnty_dup #restore sf version of cnty 
+  cnty<-cnty[cnty$GEOID %in% names,]
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_corn_mw<-cnty #save a copy of the corn producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_corn_mw<-left_join(d_corn_mw,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  d_corn_mw<-d_corn_mw[order(d_corn_mw$CNTY, d_corn_mw$YEAR),]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  # #Build the relational matrix for areas of interest
+    cnty_corn_mw<-as(cnty_corn_mw,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_corn_mw, queen=F) #create neighbors list from polygon object, neighbors share one or points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.corn_mw.rds"))
+  
+  H.adj.corn_mw<-readRDS(paste0(wd,"/output/","H.adj.corn_mw.rds"))
+
+#plot spatial object
+  #image(inla.graph2matrix(H.adj.corn_mw), xlab="", ylab="")
+
+  ##Add an index for AER
+  
+  #build list of AERs growing corn
+  names<-unique(d_corn_mw$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  
+ #clip AER file to corn producing areas and setup indexing by AER
+  AER<-AER_dup #save a copy of county file for later use
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_corn_mw<-rename(d_corn_mw,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_corn_mw<-left_join(d_corn_mw,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_corn_mw<-d_corn_mw[order(d_corn_mw$AERCODE, d_corn_mw$YEAR),]#Ordering dataset by location then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  #save original dataset
+  d_corn_reserved_mw<-d_corn_mw
+  
+```    
+
+
+
+```{r c_adjacency_sth, echo=F, warnings=F, messages=F, comment=NA, cache=T }
+##CORN COUNTY ADJACENCY FOR SOUTH
+
+#build list of counties growing corn
+  d_sth<-d[d$NAME == "South",]
+   d_corn_sth<-d_sth[d_sth$CROP == "corn" & !is.na(d_sth$YIELD),] #extract data for crop of interest for location-times when production occured
+  names<-unique(d_corn_sth$GEOID)
+  
+ #clip county file to corn producing areas and setup indexing by CNTY
+  cnty<-cnty_dup #use the saved copy of the original cnty shapefiles
+  cnty<-cnty[cnty$GEOID %in% names,]
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_corn_sth<-cnty #save a copy of the corn producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_corn_sth<-left_join(d_corn_sth,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  d_corn_sth<-d_corn_sth[order(d_corn_sth$CNTY, d_corn_sth$YEAR),]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  # #Build the relational matrix for areas of interest
+    cnty_corn_sth<-as(cnty_corn_sth,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_corn_sth, queen=F) #create neighbors list from polygon object, neighbors share one or points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.corn_sth.rds"))
+  
+  H.adj.corn_sth<-readRDS(paste0(wd,"/output/","H.adj.corn_sth.rds"))
+
+#plot spatial object
+  #image(inla.graph2matrix(H.adj.corn_sth), xlab="", ylab="")
+
+  ##Add an index for AER
+  
+  #build list of AERs growing corn
+  names<-unique(d_corn_sth$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  
+ #clip AER file to corn producing areas and setup indexing by AER
+  AER<-AER_dup #use old version of AER
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_corn_sth<-rename(d_corn_sth,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_corn_sth<-left_join(d_corn_sth,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_corn_sth<-d_corn_sth[order(d_corn_sth$AERCODE, d_corn_sth$YEAR),]#Ordering dataset by location then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  #save original dataset
+  d_corn_reserved_sth<-d_corn_sth
+  
+```
+
+
+
+```{r c_adjacency_NE, echo=F, warnings=F, messages=F, comment=NA, cache=T }
+##SETUP ADJACENCY FOR NORTHEAST
+#build list of counties growing corn
+  d_ne<-d[d$NAME == "Northeast",]
+   d_corn_ne<-d_ne[d_ne$CROP == "corn" & !is.na(d_ne$YIELD),] #extract data for crop of interest for location-times when production occured
+  names<-unique(d_corn_ne$GEOID)
+  
+ #clip county file to corn producing areas and setup indexing by CNTY
+  cnty<-cnty_dup #use the saved copy of the original cnty shapefiles
+  cnty<-cnty[cnty$GEOID %in% names,]
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_corn_ne<-cnty #save a copy of the corn producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_corn_ne<-left_join(d_corn_ne,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  d_corn_ne<-d_corn_ne[order(d_corn_ne$CNTY, d_corn_ne$YEAR),]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  # #Build the relational matrix for areas of interest
+    cnty_corn_ne<-as(cnty_corn_ne,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_corn_ne, queen=F) #create neighbors list from polygon object, neighbors share one or points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.corn_ne.rds"))
+  
+  H.adj.corn_ne<-readRDS(paste0(wd,"/output/","H.adj.corn_ne.rds"))
+
+#plot spatial object
+  #image(inla.graph2matrix(H.adj.corn_ne), xlab="", ylab="")
+
+  ##Add an index for AER
+  
+  #build list of AERs growing corn
+  names<-unique(d_corn_ne$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  
+ #clip AER file to corn producing areas and setup indexing by AER
+  AER<-AER_dup #use old version of AER
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_corn_ne<-rename(d_corn_ne,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_corn_ne<-left_join(d_corn_ne,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_corn_ne<-d_corn_ne[order(d_corn_ne$AERCODE, d_corn_ne$YEAR),]#Ordering dataset by location then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  #save original dataset
+  d_corn_reserved_ne<-d_corn_ne
+  
+```
+
+
+
+```{r c_adjacency_w, echo=F, warnings=F, messages=F, comment=NA, cache=T }
+#SETUP ADJACENCY FOR WEST
+#build list of counties growing corn
+  d_w<-d[d$NAME == "West",]
+   d_corn_w<-d_w[d_w$CROP == "corn" & !is.na(d_w$YIELD),] #extract data for crop of interest for location-times when production occured
+  names<-unique(d_corn_w$GEOID)
+  
+ #clip county file to corn producing areas and setup indexing by CNTY
+  cnty<-cnty_dup #use the saved copy of the original cnty shapefiles
+  cnty<-cnty[cnty$GEOID %in% names,]
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_corn_w<-cnty #save a copy of the corn producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_corn_w<-left_join(d_corn_w,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  d_corn_w<-d_corn_w[order(d_corn_w$CNTY, d_corn_w$YEAR),]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  # #Build the relational matrix for areas of interest
+    cnty_corn_w<-as(cnty_corn_w,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_corn_w, queen=F) #create neighbors list from polygon object, neighbors share one or points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.corn_w.rds"))
+  
+  H.adj.corn_w<-readRDS(paste0(wd,"/output/","H.adj.corn_w.rds"))
+
+#plot spatial object
+  #image(inla.graph2matrix(H.adj.corn_w), xlab="", ylab="")
+
+  ##Add an index for AER
+  
+  #build list of AERs growing corn
+  names<-unique(d_corn_w$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  
+ #clip AER file to corn producing areas and setup indexing by AER
+  AER<-AER_dup #use old version of AER
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_corn_w<-rename(d_corn_w,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_corn_w<-left_join(d_corn_w,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_corn_w<-d_corn_w[order(d_corn_w$AERCODE, d_corn_w$YEAR),]#Ordering dataset by location then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  #save original dataset
+  d_corn_reserved_w<-d_corn_w
+  
+```
+
+
+```{r corn_mw, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+d_corn_mw$SDI<-d_corn_mw$SDI_AG
+d_corn_mw$SIDI<-d_corn_mw$SIDI_AG
+d_corn_mw$RICH<-d_corn_mw$RICH_AG
+
+#SDI binned to nearest 0.01
+d_corn_mw$SIDI<-round(d_corn_mw$SIDI,2)
+#SDI binned to nearest 0.1
+d_corn_mw$SDI<-round(d_corn_mw$SDI,1)
+#TP, GDD binned to nearest 100
+d_corn_mw$TP<-round(d_corn_mw$TP,-2)
+d_corn_mw$GDD<-round(d_corn_mw$GDD,-2)
+#SDD binned to nearest 10
+d_corn_mw$SDD<-round(d_corn_mw$SDD,-1)
+#Yield transformed to log(Yield)
+d_corn_mw$YIELD<-log(d_corn_mw$YIELD)
+
+#Additional identifiers
+d_corn_mw$AERCODE.id<-d_corn_mw$AERCODE
+d_corn_mw$YEAR.id<-d_corn_mw$Yr  #so index starts at 1
+d_corn_mw$YEAR.id2<-(d_corn_mw$Yr )^2
+d_corn_mw$AERCODE.id2<-d_corn_mw$AERCODE
+
+#saveRDS(d_corn_mw,"d_corn_mw.rds")
+
+#setup pc priors
+v=sd(d_corn_mw$YIELD,na.rm=TRUE)
+n=dim(d_corn_mw)[1] 
+Q = INLA:::inla.pc.bym.Q(H.adj.corn_mw)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))             
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha   
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+        formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.corn_mw, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##CORN
+        
+          #run.model(formula, d_corn_mw,"corn","sdi_midwest_corn_ag")
+         model.results("sdi_midwest_corn_ag", d_corn_mw,"corn", diagnostics=TRUE)
+        plot.spatialeffect("sdi_midwest_corn_ag", d_corn_mw,"corn")
+        plot.smootheffect("sdi_midwest_corn_ag", var="SDI")
+        plot.smootheffect("sdi_midwest_corn_ag", var="TP")
+        plot.smootheffect("sdi_midwest_corn_ag", var="SDD")
+        plot.smootheffect("sdi_midwest_corn_ag", var="GDD")
+         crossval.randho("sdi_midwest_corn_ag_ho", formula, d_corn_mw, "corn", n=1/7)
+          
+
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.corn_mw, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##CORN
+        
+         # run.model(formula, d_corn_mw,"corn","sidi_midwest_corn_ag")
+         model.results("sidi_midwest_corn_ag", d_corn_mw,"corn", diagnostics=TRUE)
+        plot.spatialeffect("sidi_midwest_corn_ag", d_corn_mw,"corn")
+        plot.smootheffect("sidi_midwest_corn_ag", var="SIDI")
+        plot.smootheffect("sidi_midwest_corn_ag", var="TP")
+        plot.smootheffect("sidi_midwest_corn_ag", var="SDD")
+        plot.smootheffect("sidi_midwest_corn_ag", var="GDD")
+         crossval.randho("sidi_midwest_corn_ag_ho", formula, d_corn_mw, "corn", n=1/7)
+          
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.corn_mw, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##CORN
+        
+          #run.model(formula, d_corn_mw,"corn","rich_midwest_corn_ag")
+         model.results("rich_midwest_corn_ag", d_corn_mw,"corn", diagnostics=TRUE)
+        plot.spatialeffect("rich_midwest_corn_ag", d_corn_mw,"corn")
+        plot.smootheffect("rich_midwest_corn_ag", var="RICH")
+        plot.smootheffect("rich_midwest_corn_ag", var="TP")
+        plot.smootheffect("rich_midwest_corn_ag", var="SDD")
+        plot.smootheffect("rich_midwest_corn_ag", var="GDD")
+         crossval.randho("rich_midwest_corn_ag_ho", formula, d_corn_mw, "corn", n=1/7)
+
+ 
+      
+```
+
+
+
+```{r corn_s, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+d_corn_sth$SDI<-d_corn_sth$SDI_AG
+d_corn_sth$SIDI<-d_corn_sth$SIDI_AG
+d_corn_sth$RICH<-d_corn_sth$RICH_AG
+
+#SDI binned to nearest 0.01
+d_corn_sth$SIDI<-round(d_corn_sth$SIDI,2)
+#SDI binned to nearest 0.1
+d_corn_sth$SDI<-round(d_corn_sth$SDI,1)
+#TP, GDD binned to nearest 100
+d_corn_sth$TP<-round(d_corn_sth$TP,-2)
+d_corn_sth$GDD<-round(d_corn_sth$GDD,-2)
+#SDD binned to nearest 10
+d_corn_sth$SDD<-round(d_corn_sth$SDD,-1)
+#Yield transformed to log(Yield)
+d_corn_sth$YIELD<-log(d_corn_sth$YIELD)
+
+#Additional identifiers
+d_corn_sth$AERCODE.id<-d_corn_sth$AERCODE
+d_corn_sth$YEAR.id<-d_corn_sth$Yr  #so index starts at 1
+d_corn_sth$YEAR.id2<-(d_corn_sth$Yr )^2
+d_corn_sth$AERCODE.id2<-d_corn_sth$AERCODE
+
+#saveRDS(d_corn_sth,"d_corn_sth.rds")
+
+#setup pc priors
+v=sd(d_corn_sth$YIELD,na.rm=TRUE)
+n=dim(d_corn_sth)[1] 
+Q = INLA:::inla.pc.bym.Q(H.adj.corn_sth)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))             
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha   
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+        formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.corn_sth, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+          f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##CORN
+        
+          #run.model(formula, d_corn_sth,"corn","sdi_south_corn_ag")
+         model.results("sdi_south_corn_ag", d_corn_sth,"corn", diagnostics=TRUE)
+        plot.spatialeffect("sdi_south_corn_ag", d_corn_sth,"corn")
+        plot.smootheffect("sdi_south_corn_ag", var="SDI")
+        plot.smootheffect("sdi_south_corn_ag", var="TP")
+        plot.smootheffect("sdi_south_corn_ag", var="SDD")
+        plot.smootheffect("sdi_south_corn_ag", var="GDD")
+         crossval.randho("sdi_south_corn_ag_ho", formula, d_corn_sth, "corn", n=1/7)
+          
+
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.corn_sth, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+          f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##CORN
+        
+          #run.model(formula, d_corn_sth,"corn","sidi_south_corn_ag")
+         model.results("sidi_south_corn_ag", d_corn_sth,"corn", diagnostics=TRUE)
+        plot.spatialeffect("sidi_south_corn_ag", d_corn_sth,"corn")
+        plot.smootheffect("sidi_south_corn_ag", var="SIDI")
+        plot.smootheffect("sidi_south_corn_ag", var="TP")
+        plot.smootheffect("sidi_south_corn_ag", var="SDD")
+        plot.smootheffect("sidi_south_corn_ag", var="GDD")
+         crossval.randho("sidi_south_corn_ag_ho", formula, d_corn_sth, "corn", n=1/7)
+          
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.corn_sth, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##CORN
+        
+          #run.model(formula, d_corn_sth,"corn","rich_south_corn_ag")
+         model.results("rich_south_corn_ag", d_corn_sth,"corn", diagnostics=TRUE)
+        plot.spatialeffect("rich_south_corn_ag", d_corn_sth,"corn")
+        plot.smootheffect("rich_south_corn_ag", var="RICH")
+        plot.smootheffect("rich_south_corn_ag", var="TP")
+        plot.smootheffect("rich_south_corn_ag", var="SDD")
+        plot.smootheffect("rich_south_corn_ag", var="GDD")
+         crossval.randho("rich_south_corn_ag_ho", formula, d_corn_sth, "corn", n=1/7)
+
+ 
+```
+
+
+
+```{r corn_ne, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+d_corn_ne$SDI<-d_corn_ne$SDI_AG
+d_corn_ne$SIDI<-d_corn_ne$SIDI_AG
+d_corn_ne$RICH<-d_corn_ne$RICH_AG
+
+#SDI binned to nearest 0.01
+d_corn_ne$SIDI<-round(d_corn_ne$SIDI,2)
+#SDI binned to nearest 0.1
+d_corn_ne$SDI<-round(d_corn_ne$SDI,1)
+#TP, GDD binned to nearest 100
+d_corn_ne$TP<-round(d_corn_ne$TP,-2)
+d_corn_ne$GDD<-round(d_corn_ne$GDD,-2)
+#SDD binned to nearest 10
+d_corn_ne$SDD<-round(d_corn_ne$SDD,-1)
+#Yield transformed to log(Yield)
+d_corn_ne$YIELD<-log(d_corn_ne$YIELD)
+
+#Additional identifiers
+d_corn_ne$AERCODE.id<-d_corn_ne$AERCODE
+d_corn_ne$YEAR.id<-d_corn_ne$Yr  #so index starts at 1
+d_corn_ne$YEAR.id2<-(d_corn_ne$Yr )^2
+d_corn_ne$AERCODE.id2<-d_corn_ne$AERCODE
+
+#saveRDS(d_corn_ne,"d_corn_ne.rds")
+
+#setup pc priors
+v=sd(d_corn_ne$YIELD,na.rm=TRUE)
+n=dim(d_corn_ne)[1] 
+Q = INLA:::inla.pc.bym.Q(H.adj.corn_ne)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))             
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha   
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+        formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.corn_ne, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##CORN
+        
+         # run.model(formula, d_corn_ne,"corn","sdi_northeast_corn_ag")
+        model.results("sdi_northeast_corn_ag", d_corn_ne,"corn", diagnostics=TRUE)
+        plot.spatialeffect("sdi_northeast_corn_ag", d_corn_ne,"corn")
+        plot.smootheffect("sdi_northeast_corn_ag", var="SDI")
+        plot.smootheffect("sdi_northeast_corn_ag", var="TP")
+        plot.smootheffect("sdi_northeast_corn_ag", var="SDD")
+        plot.smootheffect("sdi_northeast_corn_ag", var="GDD")
+        crossval.randho("sdi_northeast_corn_ag_ho", formula, d_corn_ne, "corn", n=1/7)
+          
+
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.corn_ne, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##CORN
+        
+          #run.model(formula, d_corn_ne,"corn","sidi_northeast_corn_ag")
+         model.results("sidi_northeast_corn_ag", d_corn_ne,"corn", diagnostics=TRUE)
+        plot.spatialeffect("sidi_northeast_corn_ag", d_corn_ne,"corn")
+        plot.smootheffect("sidi_northeast_corn_ag", var="SIDI")
+        plot.smootheffect("sidi_northeast_corn_ag", var="TP")
+        plot.smootheffect("sidi_northeast_corn_ag", var="SDD")
+        plot.smootheffect("sidi_northeast_corn_ag", var="GDD")
+          crossval.randho("sidi_northeast_corn_ag_ho", formula, d_corn_ne, "corn", n=1/7)
+          
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.corn_ne, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##CORN
+        
+         # run.model(formula, d_corn_ne,"corn","rich_northeast_corn_ag")
+         model.results("rich_northeast_corn_ag", d_corn_ne,"corn", diagnostics=TRUE)
+        plot.spatialeffect("rich_northeast_corn_ag", d_corn_ne,"corn")
+        plot.smootheffect("rich_northeast_corn_ag", var="RICH")
+        plot.smootheffect("rich_northeast_corn_ag", var="TP")
+        plot.smootheffect("rich_northeast_corn_ag", var="SDD")
+        plot.smootheffect("rich_northeast_corn_ag", var="GDD")
+         crossval.randho("rich_northeast_corn_ag_ho", formula, d_corn_ne, "corn", n=1/7)
+
+ 
+      
+```
+
+
+
+```{r corn_w, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+d_corn_w$SDI<-d_corn_w$SDI_AG
+d_corn_w$SIDI<-d_corn_w$SIDI_AG
+d_corn_w$RICH<-d_corn_w$RICH_AG
+
+#SDI binned to nearest 0.01
+d_corn_w$SIDI<-round(d_corn_w$SIDI,2)
+#SDI binned to nearest 0.1
+d_corn_w$SDI<-round(d_corn_w$SDI,1)
+#TP, GDD binned to nearest 100
+d_corn_w$TP<-round(d_corn_w$TP,-2)
+d_corn_w$GDD<-round(d_corn_w$GDD,-2)
+#SDD binned to nearest 10
+d_corn_w$SDD<-round(d_corn_w$SDD,-1)
+#Yield transformed to log(Yield)
+d_corn_w$YIELD<-log(d_corn_w$YIELD)
+
+#Additional identifiers
+d_corn_w$AERCODE.id<-d_corn_w$AERCODE
+d_corn_w$YEAR.id<-d_corn_w$Yr  #so index starts at 1
+d_corn_w$YEAR.id2<-(d_corn_w$Yr )^2
+d_corn_w$AERCODE.id2<-d_corn_w$AERCODE
+
+#saveRDS(d_corn_w,"d_corn_w.rds")
+
+#setup pc priors
+v=sd(d_corn_w$YIELD,na.rm=TRUE)
+n=dim(d_corn_w)[1] 
+Q = INLA:::inla.pc.bym.Q(H.adj.corn_w)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))             
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha   
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+        formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.corn_w, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##CORN
+        
+         # run.model(formula, d_corn_w,"corn","sdi_west_corn_ag")
+         model.results("sdi_west_corn_ag", d_corn_w,"corn", diagnostics=TRUE)
+        plot.spatialeffect("sdi_west_corn_ag", d_corn_w,"corn")
+        plot.smootheffect("sdi_west_corn_ag", var="SDI")
+        plot.smootheffect("sdi_west_corn_ag", var="TP")
+        plot.smootheffect("sdi_west_corn_ag", var="SDD")
+        plot.smootheffect("sdi_west_corn_ag", var="GDD")
+         crossval.randho("sdi_west_corn_ag_ho", formula, d_corn_w, "corn", n=1/7)
+          
+
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.corn_w, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##CORN
+        
+         # run.model(formula, d_corn_w,"corn","sidi_west_corn_ag")
+         model.results("sidi_west_corn_ag", d_corn_w,"corn", diagnostics=TRUE)
+        plot.spatialeffect("sidi_west_corn_ag", d_corn_w,"corn")
+        plot.smootheffect("sidi_west_corn_ag", var="SIDI")
+        plot.smootheffect("sidi_west_corn_ag", var="TP")
+        plot.smootheffect("sidi_west_corn_ag", var="SDD")
+        plot.smootheffect("sidi_west_corn_ag", var="GDD")
+         crossval.randho("sidi_west_corn_ag_ho", formula, d_corn_w, "corn", n=1/7)
+          
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.corn_w, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##CORN
+        
+        #  run.model(formula, d_corn_w,"corn","rich_west_corn_ag")
+         model.results("rich_west_corn_ag", d_corn_w,"corn", diagnostics=TRUE)
+        plot.spatialeffect("rich_west_corn_ag", d_corn_w,"corn")
+        plot.smootheffect("rich_west_corn_ag", var="RICH")
+        plot.smootheffect("rich_west_corn_ag", var="TP")
+        plot.smootheffect("rich_west_corn_ag", var="SDD")
+        plot.smootheffect("rich_west_corn_ag", var="GDD")
+         crossval.randho("rich_west_corn_ag_ho", formula, d_corn_w, "corn", n=1/7)
+
+ 
+              
+```
+
+```{r summ_plot_regions, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+#SDI
+results_mw<-readRDS(paste0(wd,"/output/","sdi_midwest_corn_ag",".rds"))
+results_sth<-readRDS(paste0(wd,"/output/","sdi_south_corn_ag",".rds"))
+results_ne<-readRDS(paste0(wd,"/output/","sdi_northeast_corn_ag",".rds"))
+results_w<-readRDS(paste0(wd,"/output/","sdi_west_corn_ag",".rds"))
+
+results_mw<-results_mw$summary.random$SDI[ ,c(1,4,5,6)]
+results_mw$Region<-"MidWest"
+results_sth<-results_sth$summary.random$SDI[ ,c(1,4,5,6)]
+results_sth$Region<-"South"
+results_ne<-results_ne$summary.random$SDI[ ,c(1,4,5,6)]
+results_ne$Region<-"NorthEast"
+results_w<-results_w$summary.random$SDI[ ,c(1,4,5,6)]
+results_w$Region<-"West"
+
+results_tot<-as.data.frame(rbind(results_mw,results_sth,results_ne,results_w))
+
+
+    
+    p1<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Region, col=Region), size=1) + 
+      xlab("Agricultural Diversity") + ylab("Effect of  Diversity on log(Yield)") +
+      ggtitle("SDI")+
+      geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Region, fill=Region), alpha=0.25)
+    
+
+##SIDI
+results_mw<-readRDS(paste0(wd,"/output/","sidi_midwest_corn_ag",".rds"))
+results_sth<-readRDS(paste0(wd,"/output/","sidi_south_corn_ag",".rds"))
+results_ne<-readRDS(paste0(wd,"/output/","sidi_northeast_corn_ag",".rds"))
+results_w<-readRDS(paste0(wd,"/output/","sidi_west_corn_ag",".rds"))
+
+results_mw<-results_mw$summary.random$SIDI[ ,c(1,4,5,6)]
+results_mw$Region<-"MidWest"
+results_sth<-results_sth$summary.random$SIDI[ ,c(1,4,5,6)]
+results_sth$Region<-"South"
+results_ne<-results_ne$summary.random$SIDI[ ,c(1,4,5,6)]
+results_ne$Region<-"NorthEast"
+results_w<-results_w$summary.random$SIDI[ ,c(1,4,5,6)]
+results_w$Region<-"West"
+
+results_tot<-as.data.frame(rbind(results_mw,results_sth,results_ne,results_w))
+
+
+    
+    p2<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Region, col=Region), size=1) + 
+      xlab("Agricultural  Diversity") + ylab("Effect of  Diversity on log(Yield)") +
+      ggtitle("SIDI") +
+      geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Region, fill=Region), alpha=0.25)
+
+#RICH
+results_mw<-readRDS(paste0(wd,"/output/","rich_midwest_corn_ag",".rds"))
+results_sth<-readRDS(paste0(wd,"/output/","rich_south_corn_ag",".rds"))
+results_ne<-readRDS(paste0(wd,"/output/","rich_northeast_corn_ag",".rds"))
+results_w<-readRDS(paste0(wd,"/output/","rich_west_corn_ag",".rds"))
+
+results_mw<-results_mw$summary.random$RICH[ ,c(1,4,5,6)]
+results_mw$Region<-"MidWest"
+results_sth<-results_sth$summary.random$RICH[ ,c(1,4,5,6)]
+results_sth$Region<-"South"
+results_ne<-results_ne$summary.random$RICH[ ,c(1,4,5,6)]
+results_ne$Region<-"NorthEast"
+results_w<-results_w$summary.random$RICH[ ,c(1,4,5,6)]
+results_w$Region<-"West"
+
+results_tot<-as.data.frame(rbind(results_mw,results_sth,results_ne,results_w))
+
+
+    
+    p3<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Region, col=Region), size=1) + 
+      xlab("Agricultural  Diversity") + ylab("Effect of  Diversity on log(Yield)") +
+      ggtitle("RICH")+
+      geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Region, fill=Region), alpha=0.25)
+    
+        
+#Combined
+    figure<-ggarrange(p1,p2,p3,ncol=3,nrow=1,  common.legend = TRUE)
+    annotate_figure(figure, top= text_grob("Agricultural Landscape Diversity Models"))
+    
+
+```
+
+
+##REGIONAL SOY MODELS
+
+```{r s_adjacency_mw, echo=F, warnings=F, messages=F, comment=NA, cache=T }
+##soy COUNTY ADJACENCY FOR MIDWEST
+#build list of counties growing soy
+  d_mw<-d[d$NAME == "Midwest",]
+   d_soy_mw<-d_mw[d_mw$CROP == "soy" & !is.na(d_mw$YIELD),] #extract data for crop of interest for location-times when production occured
+  names<-unique(d_soy_mw$GEOID)
+  
+ #clip county file to soy producing areas and setup indexing by CNTY
+  cnty<-cnty_dup #restore sf version of cnty 
+  cnty<-cnty[cnty$GEOID %in% names,]
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_soy_mw<-cnty #save a copy of the soy producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_soy_mw<-left_join(d_soy_mw,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  d_soy_mw<-d_soy_mw[order(d_soy_mw$CNTY, d_soy_mw$YEAR),]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  # #Build the relational matrix for areas of interest
+    cnty_soy_mw<-as(cnty_soy_mw,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_soy_mw, queen=F) #create neighbors list from polygon object, neighbors share one or points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.soy_mw.rds"))
+  
+  H.adj.soy_mw<-readRDS(paste0(wd,"/output/","H.adj.soy_mw.rds"))
+
+#plot spatial object
+  #image(inla.graph2matrix(H.adj.soy_mw), xlab="", ylab="")
+
+  ##Add an index for AER
+  
+  #build list of AERs growing soy
+  names<-unique(d_soy_mw$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  
+ #clip AER file to soy producing areas and setup indexing by AER
+  AER<-AER_dup #save a copy of county file for later use
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_soy_mw<-rename(d_soy_mw,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_soy_mw<-left_join(d_soy_mw,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_soy_mw<-d_soy_mw[order(d_soy_mw$AERCODE, d_soy_mw$YEAR),]#Ordering dataset by location then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  #save original dataset
+  d_soy_reserved_mw<-d_soy_mw
+  
+```    
+
+
+
+```{r s_adjacency_sth, echo=F, warnings=F, messages=F, comment=NA, cache=T }
+##soy COUNTY ADJACENCY FOR SOUTH
+
+#build list of counties growing soy
+  d_sth<-d[d$NAME == "South",]
+   d_soy_sth<-d_sth[d_sth$CROP == "soy" & !is.na(d_sth$YIELD),] #extract data for crop of interest for location-times when production occured
+  names<-unique(d_soy_sth$GEOID)
+  
+ #clip county file to soy producing areas and setup indexing by CNTY
+  cnty<-cnty_dup #use the saved copy of the original cnty shapefiles
+  cnty<-cnty[cnty$GEOID %in% names,]
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_soy_sth<-cnty #save a copy of the soy producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_soy_sth<-left_join(d_soy_sth,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  d_soy_sth<-d_soy_sth[order(d_soy_sth$CNTY, d_soy_sth$YEAR),]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  # #Build the relational matrix for areas of interest
+    cnty_soy_sth<-as(cnty_soy_sth,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_soy_sth, queen=F) #create neighbors list from polygon object, neighbors share one or points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.soy_sth.rds"))
+  
+  H.adj.soy_sth<-readRDS(paste0(wd,"/output/","H.adj.soy_sth.rds"))
+
+#plot spatial object
+  #image(inla.graph2matrix(H.adj.soy_sth), xlab="", ylab="")
+
+  ##Add an index for AER
+  
+  #build list of AERs growing soy
+  names<-unique(d_soy_sth$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  
+ #clip AER file to soy producing areas and setup indexing by AER
+  AER<-AER_dup #use old version of AER
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_soy_sth<-rename(d_soy_sth,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_soy_sth<-left_join(d_soy_sth,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_soy_sth<-d_soy_sth[order(d_soy_sth$AERCODE, d_soy_sth$YEAR),]#Ordering dataset by location then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  #save original dataset
+  d_soy_reserved_sth<-d_soy_sth
+  
+```
+
+
+
+```{r s_adjacency_NE, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+##SETUP ADJACENCY FOR NORTHEAST
+#build list of counties growing soy
+  d_ne<-d[d$NAME == "Northeast",]
+   d_soy_ne<-d_ne[d_ne$CROP == "soy" & !is.na(d_ne$YIELD),] #extract data for crop of interest for location-times when production occured
+  names<-unique(d_soy_ne$GEOID)
+  
+ #clip county file to soy producing areas and setup indexing by CNTY
+  cnty<-cnty_dup #use the saved copy of the original cnty shapefiles
+  cnty<-cnty[cnty$GEOID %in% names,]
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_soy_ne<-cnty #save a copy of the soy producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_soy_ne<-left_join(d_soy_ne,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  d_soy_ne<-d_soy_ne[order(d_soy_ne$CNTY, d_soy_ne$YEAR),]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  # #Build the relational matrix for areas of interest
+    cnty_soy_ne<-as(cnty_soy_ne,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_soy_ne, queen=F) #create neighbors list from polygon object, neighbors share one or points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.soy_ne.rds"))
+  
+  H.adj.soy_ne<-readRDS(paste0(wd,"/output/","H.adj.soy_ne.rds"))
+
+#plot spatial object
+  #image(inla.graph2matrix(H.adj.soy_ne), xlab="", ylab="")
+
+  ##Add an index for AER
+  
+  #build list of AERs growing soy
+  names<-unique(d_soy_ne$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  
+ #clip AER file to soy producing areas and setup indexing by AER
+  AER<-AER_dup #use old version of AER
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_soy_ne<-rename(d_soy_ne,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_soy_ne<-left_join(d_soy_ne,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_soy_ne<-d_soy_ne[order(d_soy_ne$AERCODE, d_soy_ne$YEAR),]#Ordering dataset by location then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  #save original dataset
+  d_soy_reserved_ne<-d_soy_ne
+  
+```
+
+
+
+
+```{r soy_mw, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+d_soy_mw$SDI<-d_soy_mw$SDI_AG
+d_soy_mw$SIDI<-d_soy_mw$SIDI_AG
+d_soy_mw$RICH<-d_soy_mw$RICH_AG
+
+#SDI binned to nearest 0.01
+d_soy_mw$SIDI<-round(d_soy_mw$SIDI,2)
+#SDI binned to nearest 0.1
+d_soy_mw$SDI<-round(d_soy_mw$SDI,1)
+#TP, GDD binned to nearest 100
+d_soy_mw$TP<-round(d_soy_mw$TP,-2)
+d_soy_mw$GDD<-round(d_soy_mw$GDD,-2)
+#SDD binned to nearest 10
+d_soy_mw$SDD<-round(d_soy_mw$SDD,-1)
+#Yield transformed to log(Yield)
+d_soy_mw$YIELD<-log(d_soy_mw$YIELD)
+
+#Additional identifiers
+d_soy_mw$AERCODE.id<-d_soy_mw$AERCODE
+d_soy_mw$YEAR.id<-d_soy_mw$Yr  #so index starts at 1
+d_soy_mw$YEAR.id2<-(d_soy_mw$Yr )^2
+d_soy_mw$AERCODE.id2<-d_soy_mw$AERCODE
+
+#setup pc priors
+v=sd(d_soy_mw$YIELD,na.rm=TRUE)
+n=dim(d_soy_mw)[1] 
+Q = INLA:::inla.pc.bym.Q(H.adj.soy_mw)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))             
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha   
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+        formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.soy_mw, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+
+##soy
+        
+         # run.model(formula, d_soy_mw,"soy","sdi_midwest_soy_ag")
+         model.results("sdi_midwest_soy_ag", d_soy_mw,"soy", diagnostics=TRUE)
+        plot.spatialeffect("sdi_midwest_soy_ag", d_soy_mw,"soy")
+        plot.smootheffect("sdi_midwest_soy_ag", var="SDI")
+        plot.smootheffect("sdi_midwest_soy_ag", var="TP")
+        plot.smootheffect("sdi_midwest_soy_ag", var="SDD")
+        plot.smootheffect("sdi_midwest_soy_ag", var="GDD")
+         crossval.randho("sdi_midwest_soy_ag_ho", formula, d_soy_mw, "soy", n=1/7)
+          
+  formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.soy_mw, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##soy
+        
+         # run.model(formula, d_soy_mw,"soy","sidi_midwest_soy_ag")
+         model.results("sidi_midwest_soy_ag", d_soy_mw,"soy", diagnostics=TRUE)
+        plot.spatialeffect("sidi_midwest_soy_ag", d_soy_mw,"soy")
+        plot.smootheffect("sidi_midwest_soy_ag", var="SIDI")
+        plot.smootheffect("sidi_midwest_soy_ag", var="TP")
+        plot.smootheffect("sidi_midwest_soy_ag", var="SDD")
+        plot.smootheffect("sidi_midwest_soy_ag", var="GDD")
+         crossval.randho("sidi_midwest_soy_ag_ho", formula, d_soy_mw, "soy", n=1/7)
+          
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.soy_mw, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##soy
+        
+         # run.model(formula, d_soy_mw,"soy","rich_midwest_soy_ag")
+         model.results("rich_midwest_soy_ag", d_soy_mw,"soy", diagnostics=TRUE)
+        plot.spatialeffect("rich_midwest_soy_ag", d_soy_mw,"soy")
+        plot.smootheffect("rich_midwest_soy_ag", var="RICH")
+        plot.smootheffect("rich_midwest_soy_ag", var="TP")
+        plot.smootheffect("rich_midwest_soy_ag", var="SDD")
+        plot.smootheffect("rich_midwest_soy_ag", var="GDD")
+         crossval.randho("rich_midwest_soy_ag_ho", formula, d_soy_mw, "soy", n=1/7)
+
+      
+```
+
+
+
+```{r soy_s, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+d_soy_sth$SDI<-d_soy_sth$SDI_AG
+d_soy_sth$SIDI<-d_soy_sth$SIDI_AG
+d_soy_sth$RICH<-d_soy_sth$RICH_AG
+
+#SDI binned to nearest 0.01
+d_soy_sth$SIDI<-round(d_soy_sth$SIDI,2)
+#SDI binned to nearest 0.1
+d_soy_sth$SDI<-round(d_soy_sth$SDI,1)
+#TP, GDD binned to nearest 100
+d_soy_sth$TP<-round(d_soy_sth$TP,-2)
+d_soy_sth$GDD<-round(d_soy_sth$GDD,-2)
+#SDD binned to nearest 10
+d_soy_sth$SDD<-round(d_soy_sth$SDD,-1)
+#Yield transformed to log(Yield)
+d_soy_sth$YIELD<-log(d_soy_sth$YIELD)
+
+#Additional identifiers
+d_soy_sth$AERCODE.id<-d_soy_sth$AERCODE
+d_soy_sth$YEAR.id<-d_soy_sth$Yr  #so index starts at 1
+d_soy_sth$YEAR.id2<-(d_soy_sth$Yr )^2
+d_soy_sth$AERCODE.id2<-d_soy_sth$AERCODE
+
+#setup pc priors
+v=sd(d_soy_sth$YIELD,na.rm=TRUE)
+n=dim(d_soy_sth)[1] 
+Q = INLA:::inla.pc.bym.Q(H.adj.soy_sth)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))             
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha   
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+        formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.soy_sth, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+
+##soy
+        
+         # run.model(formula, d_soy_sth,"soy","sdi_south_soy_ag")
+         model.results("sdi_south_soy_ag", d_soy_sth,"soy", diagnostics=TRUE)
+        plot.spatialeffect("sdi_south_soy_ag", d_soy_sth,"soy")
+        plot.smootheffect("sdi_south_soy_ag", var="SDI")
+        plot.smootheffect("sdi_south_soy_ag", var="TP")
+        plot.smootheffect("sdi_south_soy_ag", var="SDD")
+        plot.smootheffect("sdi_south_soy_ag", var="GDD")
+         crossval.randho("sdi_south_soy_ag_ho", formula, d_soy_sth, "soy", n=1/7)
+          
+  formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.soy_sth, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##soy
+        
+         # run.model(formula, d_soy_sth,"soy","sidi_south_soy_ag")
+         model.results("sidi_south_soy_ag", d_soy_sth,"soy", diagnostics=TRUE)
+        plot.spatialeffect("sidi_south_soy_ag", d_soy_sth,"soy")
+        plot.smootheffect("sidi_south_soy_ag", var="SIDI")
+        plot.smootheffect("sidi_south_soy_ag", var="TP")
+        plot.smootheffect("sidi_south_soy_ag", var="SDD")
+        plot.smootheffect("sidi_south_soy_ag", var="GDD")
+        crossval.randho("sidi_south_soy_ag_ho", formula, d_soy_sth, "soy", n=1/7)
+          
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.soy_sth, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##soy
+        
+        #  run.model(formula, d_soy_sth,"soy","rich_south_soy_ag")
+         model.results("rich_south_soy_ag", d_soy_sth,"soy", diagnostics=TRUE)
+        plot.spatialeffect("rich_south_soy_ag", d_soy_sth,"soy")
+        plot.smootheffect("rich_south_soy_ag", var="RICH")
+        plot.smootheffect("rich_south_soy_ag", var="TP")
+        plot.smootheffect("rich_south_soy_ag", var="SDD")
+        plot.smootheffect("rich_south_soy_ag", var="GDD")
+         crossval.randho("rich_south_soy_ag_ho", formula, d_soy_sth, "soy", n=1/7)
+
+      
+```
+
+
+
+```{r soy_ne, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+d_soy_ne$SDI<-d_soy_ne$SDI_AG
+d_soy_ne$SIDI<-d_soy_ne$SIDI_AG
+d_soy_ne$RICH<-d_soy_ne$RICH_AG
+
+#SDI binned to nearest 0.01
+d_soy_ne$SIDI<-round(d_soy_ne$SIDI,2)
+#SDI binned to nearest 0.1
+d_soy_ne$SDI<-round(d_soy_ne$SDI,1)
+#TP, GDD binned to nearest 100
+d_soy_ne$TP<-round(d_soy_ne$TP,-2)
+d_soy_ne$GDD<-round(d_soy_ne$GDD,-2)
+#SDD binned to nearest 10
+d_soy_ne$SDD<-round(d_soy_ne$SDD,-1)
+#Yield transformed to log(Yield)
+d_soy_ne$YIELD<-log(d_soy_ne$YIELD)
+
+#Additional identifiers
+d_soy_ne$AERCODE.id<-d_soy_ne$AERCODE
+d_soy_ne$YEAR.id<-d_soy_ne$Yr  #so index starts at 1
+d_soy_ne$YEAR.id2<-(d_soy_ne$Yr )^2
+d_soy_ne$AERCODE.id2<-d_soy_ne$AERCODE
+
+#setup pc priors
+v=sd(d_soy_ne$YIELD,na.rm=TRUE)
+n=dim(d_soy_ne)[1] 
+Q = INLA:::inla.pc.bym.Q(H.adj.soy_ne)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))             
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha   
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+        formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.soy_ne, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+
+##soy
+        
+         # run.model(formula, d_soy_ne,"soy","sdi_northeast_soy_ag")
+         model.results("sdi_northeast_soy_ag", d_soy_ne,"soy", diagnostics=TRUE)
+        plot.spatialeffect("sdi_northeast_soy_ag", d_soy_ne,"soy")
+        plot.smootheffect("sdi_northeast_soy_ag", var="SDI")
+        plot.smootheffect("sdi_northeast_soy_ag", var="TP")
+        plot.smootheffect("sdi_northeast_soy_ag", var="SDD")
+        plot.smootheffect("sdi_northeast_soy_ag", var="GDD")
+         crossval.randho("sdi_northeast_soy_ag_ho", formula, d_soy_ne, "soy", n=1/7)
+          
+  formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.soy_ne, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##soy
+        
+         # run.model(formula, d_soy_ne,"soy","sidi_northeast_soy_ag")
+         model.results("sidi_northeast_soy_ag", d_soy_ne,"soy", diagnostics=TRUE)
+        plot.spatialeffect("sidi_northeast_soy_ag", d_soy_ne,"soy")
+        plot.smootheffect("sidi_northeast_soy_ag", var="SIDI")
+        plot.smootheffect("sidi_northeast_soy_ag", var="TP")
+        plot.smootheffect("sidi_northeast_soy_ag", var="SDD")
+        plot.smootheffect("sidi_northeast_soy_ag", var="GDD")
+         crossval.randho("sidi_northeast_soy_ag_ho", formula, d_soy_ne, "soy", n=1/7)
+          
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.soy_ne, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##soy
+        
+         # run.model(formula, d_soy_ne,"soy","rich_northeast_soy_ag")
+         model.results("rich_northeast_soy_ag", d_soy_ne,"soy", diagnostics=TRUE)
+        plot.spatialeffect("rich_northeast_soy_ag", d_soy_ne,"soy")
+        plot.smootheffect("rich_northeast_soy_ag", var="RICH")
+        plot.smootheffect("rich_northeast_soy_ag", var="TP")
+        plot.smootheffect("rich_northeast_soy_ag", var="SDD")
+        plot.smootheffect("rich_northeast_soy_ag", var="GDD")
+         crossval.randho("rich_northeast_soy_ag_ho", formula, d_soy_ne, "soy", n=1/7)
+
+      
+```
+
+
+
+```{r summ_plot_regions2, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+#SDI
+results_mw<-readRDS(paste0(wd,"/output/","sdi_midwest_soy_ag",".rds"))
+results_sth<-readRDS(paste0(wd,"/output/","sdi_south_soy_ag",".rds"))
+results_ne<-readRDS(paste0(wd,"/output/","sdi_northeast_soy_ag",".rds"))
+
+
+results_mw<-results_mw$summary.random$SDI[ ,c(1,4,5,6)]
+results_mw$Region<-"MidWest"
+results_sth<-results_sth$summary.random$SDI[ ,c(1,4,5,6)]
+results_sth$Region<-"South"
+results_ne<-results_ne$summary.random$SDI[ ,c(1,4,5,6)]
+results_ne$Region<-"NorthEast"
+
+
+results_tot<-as.data.frame(rbind(results_mw,results_sth,results_ne))
+
+
+    
+    p4<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Region, col=Region), size=1) + 
+      xlab("Agricultural Diversity") + ylab("Effect of Diversity on log(Yield)") +
+      ggtitle(paste("SDI ")) +
+      geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Region, fill=Region), alpha=0.25)
+
+##SIDI
+results_mw<-readRDS(paste0(wd,"/output/","sidi_midwest_soy_ag",".rds"))
+results_sth<-readRDS(paste0(wd,"/output/","sidi_south_soy_ag",".rds"))
+results_ne<-readRDS(paste0(wd,"/output/","sidi_northeast_soy_ag",".rds"))
+
+
+results_mw<-results_mw$summary.random$SIDI[ ,c(1,4,5,6)]
+results_mw$Region<-"MidWest"
+results_sth<-results_sth$summary.random$SIDI[ ,c(1,4,5,6)]
+results_sth$Region<-"South"
+results_ne<-results_ne$summary.random$SIDI[ ,c(1,4,5,6)]
+results_ne$Region<-"NorthEast"
+
+
+results_tot<-as.data.frame(rbind(results_mw,results_sth,results_ne))
+
+
+    
+    p5<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Region, col=Region), size=1) + 
+      xlab("Agricultural Diversity") + ylab("Effect of Diversity on log(Yield)") +
+      ggtitle(paste("SIDI")) +
+      geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Region, fill=Region), alpha=0.25)
+
+#RICH
+results_mw<-readRDS(paste0(wd,"/output/","rich_midwest_soy_ag",".rds"))
+results_sth<-readRDS(paste0(wd,"/output/","rich_south_soy_ag",".rds"))
+results_ne<-readRDS(paste0(wd,"/output/","rich_northeast_soy_ag",".rds"))
+
+
+results_mw<-results_mw$summary.random$RICH[ ,c(1,4,5,6)]
+results_mw$Region<-"MidWest"
+results_sth<-results_sth$summary.random$RICH[ ,c(1,4,5,6)]
+results_sth$Region<-"South"
+results_ne<-results_ne$summary.random$RICH[ ,c(1,4,5,6)]
+results_ne$Region<-"NorthEast"
+
+
+results_tot<-as.data.frame(rbind(results_mw,results_sth,results_ne))
+
+
+    
+    p6<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Region, col=Region), size=1) + 
+      xlab("Agricultural Diversity") + ylab("Effect of  Diversity on log(Yield)") +
+      ggtitle(paste("RICH")) +
+      geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Region, fill=Region), alpha=0.25)
+    
+    #Combined
+    figure<-ggarrange(p4,p5,p6,ncol=3,nrow=1,  common.legend = TRUE)
+    annotate_figure(figure, top= text_grob("Agricultural Landscape Diversity Models"))
+```
+
+
+##REGIONAL WINTER WHEAT MODELS
+
+```{r ww_adjacency_mw, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+##wwheat COUNTY ADJACENCY FOR MIDWEST
+#build list of counties growing wwheat
+  d_mw<-d[d$NAME == "Midwest",]
+   d_wwheat_mw<-d_mw[d_mw$CROP == "wwheat" & !is.na(d_mw$YIELD),] #extract data for crop of interest for location-times when production occured
+  names<-unique(d_wwheat_mw$GEOID)
+  
+ #clip county file to wwheat producing areas and setup indexing by CNTY
+  cnty<-cnty_dup #restore sf version of cnty 
+  cnty<-cnty[cnty$GEOID %in% names,]
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_wwheat_mw<-cnty #save a copy of the wwheat producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_wwheat_mw<-left_join(d_wwheat_mw,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  d_wwheat_mw<-d_wwheat_mw[order(d_wwheat_mw$CNTY, d_wwheat_mw$YEAR),]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  # #Build the relational matrix for areas of interest
+    cnty_wwheat_mw<-as(cnty_wwheat_mw,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_wwheat_mw, queen=F) #create neighbors list from polygon object, neighbors share one or points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.wwheat_mw.rds"))
+  
+  H.adj.wwheat_mw<-readRDS(paste0(wd,"/output/","H.adj.wwheat_mw.rds"))
+
+#plot spatial object
+  #image(inla.graph2matrix(H.adj.wwheat_mw), xlab="", ylab="")
+
+  ##Add an index for AER
+  
+  #build list of AERs growing wwheat
+  names<-unique(d_wwheat_mw$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  
+ #clip AER file to wwheat producing areas and setup indexing by AER
+  AER<-AER_dup #save a copy of county file for later use
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_wwheat_mw<-rename(d_wwheat_mw,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_wwheat_mw<-left_join(d_wwheat_mw,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_wwheat_mw<-d_wwheat_mw[order(d_wwheat_mw$AERCODE, d_wwheat_mw$YEAR),]#Ordering dataset by location then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  #save original dataset
+  d_wwheat_reserved_mw<-d_wwheat_mw
+  
+```    
+
+
+
+```{r ww_adjacency_sth, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+##wwheat COUNTY ADJACENCY FOR SOUTH
+
+#build list of counties growing wwheat
+  d_sth<-d[d$NAME == "South",]
+   d_wwheat_sth<-d_sth[d_sth$CROP == "wwheat" & !is.na(d_sth$YIELD),] #extract data for crop of interest for location-times when production occured
+  names<-unique(d_wwheat_sth$GEOID)
+  
+ #clip county file to wwheat producing areas and setup indexing by CNTY
+  cnty<-cnty_dup #use the saved copy of the original cnty shapefiles
+  cnty<-cnty[cnty$GEOID %in% names,]
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_wwheat_sth<-cnty #save a copy of the wwheat producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_wwheat_sth<-left_join(d_wwheat_sth,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  d_wwheat_sth<-d_wwheat_sth[order(d_wwheat_sth$CNTY, d_wwheat_sth$YEAR),]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  # #Build the relational matrix for areas of interest
+    cnty_wwheat_sth<-as(cnty_wwheat_sth,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_wwheat_sth, queen=F) #create neighbors list from polygon object, neighbors share one or points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.wwheat_sth.rds"))
+  
+  H.adj.wwheat_sth<-readRDS(paste0(wd,"/output/","H.adj.wwheat_sth.rds"))
+
+#plot spatial object
+  #image(inla.graph2matrix(H.adj.wwheat_sth), xlab="", ylab="")
+
+  ##Add an index for AER
+  
+  #build list of AERs growing wwheat
+  names<-unique(d_wwheat_sth$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  
+ #clip AER file to wwheat producing areas and setup indexing by AER
+  AER<-AER_dup #use old version of AER
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_wwheat_sth<-rename(d_wwheat_sth,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_wwheat_sth<-left_join(d_wwheat_sth,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_wwheat_sth<-d_wwheat_sth[order(d_wwheat_sth$AERCODE, d_wwheat_sth$YEAR),]#Ordering dataset by location then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  #save original dataset
+  d_wwheat_reserved_sth<-d_wwheat_sth
+  
+```
+
+
+
+```{r ww_adjacency_NE, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+##SETUP ADJACENCY FOR NORTHEAST
+#build list of counties growing wwheat
+  d_ne<-d[d$NAME == "Northeast",]
+   d_wwheat_ne<-d_ne[d_ne$CROP == "wwheat" & !is.na(d_ne$YIELD),] #extract data for crop of interest for location-times when production occured
+  names<-unique(d_wwheat_ne$GEOID)
+  
+ #clip county file to wwheat producing areas and setup indexing by CNTY
+  cnty<-cnty_dup #use the saved copy of the original cnty shapefiles
+  cnty<-cnty[cnty$GEOID %in% names,]
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_wwheat_ne<-cnty #save a copy of the wwheat producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_wwheat_ne<-left_join(d_wwheat_ne,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  d_wwheat_ne<-d_wwheat_ne[order(d_wwheat_ne$CNTY, d_wwheat_ne$YEAR),]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  # #Build the relational matrix for areas of interest
+    cnty_wwheat_ne<-as(cnty_wwheat_ne,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_wwheat_ne, queen=F) #create neighbors list from polygon object, neighbors share one or points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.wwheat_ne.rds"))
+  
+  H.adj.wwheat_ne<-readRDS(paste0(wd,"/output/","H.adj.wwheat_ne.rds"))
+
+#plot spatial object
+  #image(inla.graph2matrix(H.adj.wwheat_ne), xlab="", ylab="")
+
+  ##Add an index for AER
+  
+  #build list of AERs growing wwheat
+  names<-unique(d_wwheat_ne$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  
+ #clip AER file to wwheat producing areas and setup indexing by AER
+  AER<-AER_dup #use old version of AER
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_wwheat_ne<-rename(d_wwheat_ne,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_wwheat_ne<-left_join(d_wwheat_ne,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_wwheat_ne<-d_wwheat_ne[order(d_wwheat_ne$AERCODE, d_wwheat_ne$YEAR),]#Ordering dataset by location then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  #save original dataset
+  d_wwheat_reserved_ne<-d_wwheat_ne
+  
+```
+
+
+
+```{r ww_adjacency_w, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+#SETUP ADJACENCY FOR WEST
+#build list of counties growing wwheat
+  d_w<-d[d$NAME == "West",]
+   d_wwheat_w<-d_w[d_w$CROP == "wwheat" & !is.na(d_w$YIELD),] #extract data for crop of interest for location-times when production occured
+  names<-unique(d_wwheat_w$GEOID)
+  
+ #clip county file to wwheat producing areas and setup indexing by CNTY
+  cnty<-cnty_dup #use the saved copy of the original cnty shapefiles
+  cnty<-cnty[cnty$GEOID %in% names,]
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_wwheat_w<-cnty #save a copy of the wwheat producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_wwheat_w<-left_join(d_wwheat_w,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  d_wwheat_w<-d_wwheat_w[order(d_wwheat_w$CNTY, d_wwheat_w$YEAR),]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  # #Build the relational matrix for areas of interest
+    cnty_wwheat_w<-as(cnty_wwheat_w,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_wwheat_w, queen=F) #create neighbors list from polygon object, neighbors share one or points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.wwheat_w.rds"))
+  
+  H.adj.wwheat_w<-readRDS(paste0(wd,"/output/","H.adj.wwheat_w.rds"))
+
+#plot spatial object
+  #image(inla.graph2matrix(H.adj.wwheat_w), xlab="", ylab="")
+
+  ##Add an index for AER
+  
+  #build list of AERs growing wwheat
+  names<-unique(d_wwheat_w$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  
+ #clip AER file to wwheat producing areas and setup indexing by AER
+  AER<-AER_dup #use old version of AER
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_wwheat_w<-rename(d_wwheat_w,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_wwheat_w<-left_join(d_wwheat_w,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_wwheat_w<-d_wwheat_w[order(d_wwheat_w$AERCODE, d_wwheat_w$YEAR),]#Ordering dataset by location then time for modeling as is done in the Ohio example in chapter 7 of r-inla book
+ 
+  #save original dataset
+  d_wwheat_reserved_w<-d_wwheat_w
+  
+```
+
+
+```{r wwheat_mw, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+d_wwheat_mw$SDI<-d_wwheat_mw$SDI_AG
+d_wwheat_mw$SIDI<-d_wwheat_mw$SIDI_AG
+d_wwheat_mw$RICH<-d_wwheat_mw$RICH_AG
+
+#SDI binned to nearest 0.01
+d_wwheat_mw$SIDI<-round(d_wwheat_mw$SIDI,2)
+#SDI binned to nearest 0.1
+d_wwheat_mw$SDI<-round(d_wwheat_mw$SDI,1)
+#TP, GDD binned to nearest 100
+d_wwheat_mw$TP<-round(d_wwheat_mw$TP,-2)
+d_wwheat_mw$GDD<-round(d_wwheat_mw$GDD,-2)
+#SDD binned to nearest 10
+d_wwheat_mw$SDD<-round(d_wwheat_mw$SDD,-1)
+#Yield transformed to log(Yield)
+d_wwheat_mw$YIELD<-log(d_wwheat_mw$YIELD)
+
+#Additional identifiers
+d_wwheat_mw$AERCODE.id<-d_wwheat_mw$AERCODE
+d_wwheat_mw$YEAR.id<-d_wwheat_mw$Yr  #so index starts at 1
+d_wwheat_mw$YEAR.id2<-(d_wwheat_mw$Yr )^2
+d_wwheat_mw$AERCODE.id2<-d_wwheat_mw$AERCODE
+
+#setup pc priors
+v=sd(d_wwheat_mw$YIELD,na.rm=TRUE)
+n=dim(d_wwheat_mw)[1] 
+Q = INLA:::inla.pc.bym.Q(H.adj.wwheat_mw)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))             
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha   
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+        formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.wwheat_mw, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+
+##wwheat
+        
+        # run.model(formula, d_wwheat_mw,"wwheat","sdi_midwest_wwheat_ag")
+        model.results("sdi_midwest_wwheat_ag", d_wwheat_mw,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("sdi_midwest_wwheat_ag", d_wwheat_mw,"wwheat")
+        plot.smootheffect("sdi_midwest_wwheat_ag", var="SDI")
+        plot.smootheffect("sdi_midwest_wwheat_ag", var="TP")
+        plot.smootheffect("sdi_midwest_wwheat_ag", var="SDD")
+        plot.smootheffect("sdi_midwest_wwheat_ag", var="GDD")
+        crossval.randho("sdi_midwest_wwheat_ag_ho", formula, d_wwheat_mw, "wwheat", n=1/7)
+          
+  formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.wwheat_mw, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##wwheat
+        
+         # run.model(formula, d_wwheat_mw,"wwheat","sidi_midwest_wwheat_ag")
+         model.results("sidi_midwest_wwheat_Ag", d_wwheat_mw,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("sidi_midwest_wwheat_ag", d_wwheat_mw,"wwheat")
+        plot.smootheffect("sidi_midwest_wwheat_ag", var="SIDI")
+        plot.smootheffect("sidi_midwest_wwheat_ag", var="TP")
+        plot.smootheffect("sidi_midwest_wwheat_ag", var="SDD")
+        plot.smootheffect("sidi_midwest_wwheat_ag", var="GDD")
+        crossval.randho("sidi_midwest_wwheat_ag_ho", formula, d_wwheat_mw, "wwheat", n=1/7)
+          
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.wwheat_mw, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##wwheat
+        
+         # run.model(formula, d_wwheat_mw,"wwheat","rich_midwest_wwheat_ag")
+         model.results("rich_midwest_wwheat_ag", d_wwheat_mw,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("rich_midwest_wwheat_ag", d_wwheat_mw,"wwheat")
+        plot.smootheffect("rich_midwest_wwheat_ag", var="RICH")
+        plot.smootheffect("rich_midwest_wwheat_ag", var="TP")
+        plot.smootheffect("rich_midwest_wwheat_ag", var="SDD")
+        plot.smootheffect("rich_midwest_wwheat_ag", var="GDD")
+         crossval.randho("rich_midwest_wwheat_ag_ho", formula, d_wwheat_mw, "wwheat", n=1/7)
+
+
+      
+```
+
+
+
+```{r wwheat_s, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+d_wwheat_sth$SDI<-d_wwheat_sth$SDI_AG
+d_wwheat_sth$SIDI<-d_wwheat_sth$SIDI_AG
+d_wwheat_sth$RICH<-d_wwheat_sth$RICH_AG
+
+#SDI binned to nearest 0.01
+d_wwheat_sth$SIDI<-round(d_wwheat_sth$SIDI,2)
+#SDI binned to nearest 0.1
+d_wwheat_sth$SDI<-round(d_wwheat_sth$SDI,1)
+#TP, GDD binned to nearest 100
+d_wwheat_sth$TP<-round(d_wwheat_sth$TP,-2)
+d_wwheat_sth$GDD<-round(d_wwheat_sth$GDD,-2)
+#SDD binned to nearest 10
+d_wwheat_sth$SDD<-round(d_wwheat_sth$SDD,-1)
+#Yield transformed to log(Yield)
+d_wwheat_sth$YIELD<-log(d_wwheat_sth$YIELD)
+
+#Additional identifiers
+d_wwheat_sth$AERCODE.id<-d_wwheat_sth$AERCODE
+d_wwheat_sth$YEAR.id<-d_wwheat_sth$Yr  #so index starts at 1
+d_wwheat_sth$YEAR.id2<-(d_wwheat_sth$Yr )^2
+d_wwheat_sth$AERCODE.id2<-d_wwheat_sth$AERCODE
+
+#setup pc priors
+v=sd(d_wwheat_sth$YIELD,na.rm=TRUE)
+n=dim(d_wwheat_sth)[1] 
+Q = INLA:::inla.pc.bym.Q(H.adj.wwheat_sth)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))             
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha   
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+        formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.wwheat_sth, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+
+##wwheat
+        
+         # run.model(formula, d_wwheat_sth,"wwheat","sdi_south_wwheat_ag")
+         model.results("sdi_south_wwheat_ag", d_wwheat_sth,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("sdi_south_wwheat_ag", d_wwheat_sth,"wwheat")
+        plot.smootheffect("sdi_south_wwheat_ag", var="SDI")
+        plot.smootheffect("sdi_south_wwheat_ag", var="TP")
+        plot.smootheffect("sdi_south_wwheat_ag", var="SDD")
+        plot.smootheffect("sdi_south_wwheat_ag", var="GDD")
+         crossval.randho("sdi_south_wwheat_ag_ho", formula, d_wwheat_sth, "wwheat", n=1/7)
+          
+  formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.wwheat_sth, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##wwheat
+        
+        #  run.model(formula, d_wwheat_sth,"wwheat","sidi_south_wwheat_ag")
+         model.results("sidi_south_wwheat_ag", d_wwheat_sth,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("sidi_south_wwheat_ag", d_wwheat_sth,"wwheat")
+        plot.smootheffect("sidi_south_wwheat_ag", var="SIDI")
+        plot.smootheffect("sidi_south_wwheat_ag", var="TP")
+        plot.smootheffect("sidi_south_wwheat_ag", var="SDD")
+        plot.smootheffect("sidi_south_wwheat_ag", var="GDD")
+         crossval.randho("sidi_south_wwheat_ag_ho", formula, d_wwheat_sth, "wwheat", n=1/7)
+          
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.wwheat_sth, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##wwheat
+        
+         # run.model(formula, d_wwheat_sth,"wwheat","rich_south_wwheat_ag")
+         model.results("rich_south_wwheat_ag", d_wwheat_sth,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("rich_south_wwheat_ag", d_wwheat_sth,"wwheat")
+        plot.smootheffect("rich_south_wwheat_ag", var="RICH")
+        plot.smootheffect("rich_south_wwheat_ag", var="TP")
+        plot.smootheffect("rich_south_wwheat_ag", var="SDD")
+        plot.smootheffect("rich_south_wwheat_ag", var="GDD")
+         crossval.randho("rich_south_wwheat_ag_ho", formula, d_wwheat_sth, "wwheat", n=1/7)
+      
+```
+
+
+
+```{r wwheat_ne, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+d_wwheat_ne$SDI<-d_wwheat_ne$SDI_AG
+d_wwheat_ne$SIDI<-d_wwheat_ne$SIDI_AG
+d_wwheat_ne$RICH<-d_wwheat_ne$RICH_AG
+
+#SDI binned to nearest 0.01
+d_wwheat_ne$SIDI<-round(d_wwheat_ne$SIDI,2)
+#SDI binned to nearest 0.1
+d_wwheat_ne$SDI<-round(d_wwheat_ne$SDI,1)
+#TP, GDD binned to nearest 100
+d_wwheat_ne$TP<-round(d_wwheat_ne$TP,-2)
+d_wwheat_ne$GDD<-round(d_wwheat_ne$GDD,-2)
+#SDD binned to nearest 10
+d_wwheat_ne$SDD<-round(d_wwheat_ne$SDD,-1)
+#Yield transformed to log(Yield)
+d_wwheat_ne$YIELD<-log(d_wwheat_ne$YIELD)
+
+#Additional identifiers
+d_wwheat_ne$AERCODE.id<-d_wwheat_ne$AERCODE
+d_wwheat_ne$YEAR.id<-d_wwheat_ne$Yr  #so index starts at 1
+d_wwheat_ne$YEAR.id2<-(d_wwheat_ne$Yr )^2
+d_wwheat_ne$AERCODE.id2<-d_wwheat_ne$AERCODE
+
+#setup pc priors
+v=sd(d_wwheat_ne$YIELD,na.rm=TRUE)
+n=dim(d_wwheat_ne)[1] 
+Q = INLA:::inla.pc.bym.Q(H.adj.wwheat_ne)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))             
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha   
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+        formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.wwheat_ne, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+
+##wwheat
+        
+         # run.model(formula, d_wwheat_ne,"wwheat","sdi_northeast_wwheat_ag")
+         model.results("sdi_northeast_wwheat_ag", d_wwheat_ne,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("sdi_northeast_wwheat_ag", d_wwheat_ne,"wwheat")
+        plot.smootheffect("sdi_northeast_wwheat_ag", var="SDI")
+        plot.smootheffect("sdi_northeast_wwheat_ag", var="TP")
+        plot.smootheffect("sdi_northeast_wwheat_ag", var="SDD")
+        plot.smootheffect("sdi_northeast_wwheat_ag", var="GDD")
+         crossval.randho("sdi_northeast_wwheat_ag_ho", formula, d_wwheat_ne, "wwheat", n=1/7)
+          
+  formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.wwheat_ne, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##wwheat
+        
+        #  run.model(formula, d_wwheat_ne,"wwheat","sidi_northeast_wwheat_ag")
+         model.results("sidi_northeast_wwheat_ag", d_wwheat_ne,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("sidi_northeast_wwheat_ag", d_wwheat_ne,"wwheat")
+        plot.smootheffect("sidi_northeast_wwheat_ag", var="SIDI")
+        plot.smootheffect("sidi_northeast_wwheat_ag", var="TP")
+        plot.smootheffect("sidi_northeast_wwheat_ag", var="SDD")
+        plot.smootheffect("sidi_northeast_wwheat_ag", var="GDD")
+         crossval.randho("sidi_northeast_wwheat_ag_ho", formula, d_wwheat_ne, "wwheat", n=1/7)
+          
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.wwheat_ne, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##wwheat
+        
+        # run.model(formula, d_wwheat_ne,"wwheat","rich_northeast_wwheat_ag")
+         model.results("rich_northeast_wwheat_ag", d_wwheat_ne,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("rich_northeast_wwheat_ag", d_wwheat_ne,"wwheat")
+        plot.smootheffect("rich_northeast_wwheat_ag", var="RICH")
+        plot.smootheffect("rich_northeast_wwheat_ag", var="TP")
+        plot.smootheffect("rich_northeast_wwheat_ag", var="SDD")
+        plot.smootheffect("rich_northeast_wwheat_ag", var="GDD")
+         crossval.randho("rich_northeast_wwheat_ag_ho", formula, d_wwheat_ne, "wwheat", n=1/7)
+      
+```
+
+
+
+```{r wwheat_w, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+d_wwheat_w$SDI<-d_wwheat_w$SDI_AG
+d_wwheat_w$SIDI<-d_wwheat_w$SIDI_AG
+d_wwheat_w$RICH<-d_wwheat_w$RICH_AG
+
+#SDI binned to nearest 0.01
+d_wwheat_w$SIDI<-round(d_wwheat_w$SIDI,2)
+#SDI binned to nearest 0.1
+d_wwheat_w$SDI<-round(d_wwheat_w$SDI,1)
+#TP, GDD binned to nearest 100
+d_wwheat_w$TP<-round(d_wwheat_w$TP,-2)
+d_wwheat_w$GDD<-round(d_wwheat_w$GDD,-2)
+#SDD binned to nearest 10
+d_wwheat_w$SDD<-round(d_wwheat_w$SDD,-1)
+#Yield transformed to log(Yield)
+d_wwheat_w$YIELD<-log(d_wwheat_w$YIELD)
+
+#Additional identifiers
+d_wwheat_w$AERCODE.id<-d_wwheat_w$AERCODE
+d_wwheat_w$YEAR.id<-d_wwheat_w$Yr  #so index starts at 1
+d_wwheat_w$YEAR.id2<-(d_wwheat_w$Yr )^2
+d_wwheat_w$AERCODE.id2<-d_wwheat_w$AERCODE
+
+#setup pc priors
+v=sd(d_wwheat_w$YIELD,na.rm=TRUE)
+n=dim(d_wwheat_w)[1] 
+Q = INLA:::inla.pc.bym.Q(H.adj.wwheat_w)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))             
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha   
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+        formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.wwheat_w, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+
+##wwheat
+        
+         # run.model(formula, d_wwheat_w,"wwheat","sdi_west_wwheat_ag")
+         model.results("sdi_west_wwheat_ag", d_wwheat_w,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("sdi_west_wwheat_ag", d_wwheat_w,"wwheat")
+        plot.smootheffect("sdi_west_wwheat_ag", var="SDI")
+        plot.smootheffect("sdi_west_wwheat_ag", var="TP")
+        plot.smootheffect("sdi_west_wwheat_ag", var="SDD")
+        plot.smootheffect("sdi_west_wwheat_ag", var="GDD")
+         crossval.randho("sdi_west_wwheat_ag_ho", formula, d_wwheat_w, "wwheat", n=1/7)
+          
+  formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.wwheat_w, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##wwheat
+        
+         # run.model(formula, d_wwheat_w,"wwheat","sidi_west_wwheat_ag")
+         model.results("sidi_west_wwheat_ag", d_wwheat_w,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("sidi_west_wwheat_ag", d_wwheat_w,"wwheat")
+        plot.smootheffect("sidi_west_wwheat_ag", var="SIDI")
+        plot.smootheffect("sidi_west_wwheat_ag", var="TP")
+        plot.smootheffect("sidi_west_wwheat_ag", var="SDD")
+        plot.smootheffect("sidi_west_wwheat_ag", var="GDD")
+         crossval.randho("sidi_west_wwheat_ag_ho", formula, d_wwheat_w, "wwheat", n=1/7)
+          
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+          f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+          f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+          f(CNTY, model="bym2", graph=H.adj.wwheat_w, scale.model=TRUE, constr = TRUE, 
+                                                             hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                                                                        prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+           f(AERCODE.id, YEAR.id, model="iid")+ f(AERCODE.id2, YEAR.id2, model="iid")
+##wwheat
+        
+         # run.model(formula, d_wwheat_w,"wwheat","rich_west_wwheat_ag")
+         model.results("rich_west_wwheat_ag", d_wwheat_w,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("rich_west_wwheat_ag", d_wwheat_w,"wwheat")
+        plot.smootheffect("rich_west_wwheat_ag", var="RICH")
+        plot.smootheffect("rich_west_wwheat_ag", var="TP")
+        plot.smootheffect("rich_west_wwheat_ag", var="SDD")
+        plot.smootheffect("rich_west_wwheat_ag", var="GDD")
+         crossval.randho("rich_west_wwheat_ag_ho", formula, d_wwheat_w, "wwheat", n=1/7)
+              
+```
+
+```{r summ_plot_regions3, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+#SDI
+results_mw<-readRDS(paste0(wd,"/output/","sdi_midwest_wwheat_ag",".rds"))
+results_sth<-readRDS(paste0(wd,"/output/","sdi_south_wwheat_ag",".rds"))
+results_ne<-readRDS(paste0(wd,"/output/","sdi_northeast_wwheat_ag",".rds"))
+results_w<-readRDS(paste0(wd,"/output/","sdi_west_wwheat_ag",".rds"))
+
+results_mw<-results_mw$summary.random$SDI[ ,c(1,4,5,6)]
+results_mw$Region<-"MidWest"
+results_sth<-results_sth$summary.random$SDI[ ,c(1,4,5,6)]
+results_sth$Region<-"South"
+results_ne<-results_ne$summary.random$SDI[ ,c(1,4,5,6)]
+results_ne$Region<-"NorthEast"
+results_w<-results_w$summary.random$SDI[ ,c(1,4,5,6)]
+results_w$Region<-"West"
+
+results_tot<-as.data.frame(rbind(results_mw,results_sth,results_ne,results_w))
+
+
+    
+    p7<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Region, col=Region), size=1) + 
+      xlab("Agricultural Diversity") + ylab("Effect of Diversity on log(Yield)") +
+      ggtitle(paste("SDI")) +
+      geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Region, fill=Region), alpha=0.25)
+
+##SIDI
+results_mw<-readRDS(paste0(wd,"/output/","sidi_midwest_wwheat_ag",".rds"))
+results_sth<-readRDS(paste0(wd,"/output/","sidi_south_wwheat_ag",".rds"))
+results_ne<-readRDS(paste0(wd,"/output/","sidi_northeast_wwheat_ag",".rds"))
+results_w<-readRDS(paste0(wd,"/output/","sidi_west_wwheat_ag",".rds"))
+
+results_mw<-results_mw$summary.random$SIDI[ ,c(1,4,5,6)]
+results_mw$Region<-"MidWest"
+results_sth<-results_sth$summary.random$SIDI[ ,c(1,4,5,6)]
+results_sth$Region<-"South"
+results_ne<-results_ne$summary.random$SIDI[ ,c(1,4,5,6)]
+results_ne$Region<-"NorthEast"
+results_w<-results_w$summary.random$SIDI[ ,c(1,4,5,6)]
+results_w$Region<-"West"
+
+results_tot<-as.data.frame(rbind(results_mw,results_sth,results_ne,results_w))
+
+
+    
+    p8<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Region, col=Region), size=1) + 
+      xlab("Agricultural Diversity") + ylab("Effect of Diversity on log(Yield)") +
+      ggtitle(paste("SIDI ")) +
+      geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Region, fill=Region), alpha=0.25)
+
+#RICH
+results_mw<-readRDS(paste0(wd,"/output/","rich_midwest_wwheat_ag",".rds"))
+results_sth<-readRDS(paste0(wd,"/output/","rich_south_wwheat_ag",".rds"))
+results_ne<-readRDS(paste0(wd,"/output/","rich_northeast_wwheat_ag",".rds"))
+results_w<-readRDS(paste0(wd,"/output/","rich_west_wwheat_ag",".rds"))
+
+results_mw<-results_mw$summary.random$RICH[ ,c(1,4,5,6)]
+results_mw$Region<-"MidWest"
+results_sth<-results_sth$summary.random$RICH[ ,c(1,4,5,6)]
+results_sth$Region<-"South"
+results_ne<-results_ne$summary.random$RICH[ ,c(1,4,5,6)]
+results_ne$Region<-"NorthEast"
+results_w<-results_w$summary.random$RICH[ ,c(1,4,5,6)]
+results_w$Region<-"West"
+
+results_tot<-as.data.frame(rbind(results_mw,results_sth,results_ne,results_w))
+
+
+    
+    p9<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Region, col=Region), size=1) + 
+      xlab("AgriculturalDiversity") + ylab("Effect of  Diversity on log(Yield)") +
+      ggtitle(paste("RICH")) +
+      geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Region, fill=Region), alpha=0.25)
+    
+    #Combined
+    figure<-ggarrange(p7,p8,p9,ncol=3,nrow=1,  common.legend = TRUE)
+    annotate_figure(figure, top= text_grob("Agricultural Landscape Diversity Models"))
+    
+```
+ 
+## Climate Effects Summary for Midwest
+```{r climate1, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+knitr::include_graphics(paste0(wd,'/Midwest log(Yield) for climate 3x3.jpeg'))
+
+```
+ 
+## Climate Effects Summary for South
+```{r climate2, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+ 
+        knitr::include_graphics(paste0(wd,'/South log(Yield) for climate 3x3.jpeg'))
+```        
+
+## Climate Effects Summary for Northeast
+```{r climate3, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+ 
+        knitr::include_graphics(paste0(wd,'/Northeast log(Yield) for climate 3x3.jpeg'))
+``` 
+
+## Climate Effects Summary for West
+```{r climate4, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+ 
+        knitr::include_graphics(paste0(wd,'/West log(Yield) for climate 3x3.jpeg'))
+```
+     

@@ -1,0 +1,1011 @@
+---
+title: 'The  impact of agricultural diversification on U.S. crop production: National Models Estimation and Diagnostics'
+author: "Kate Nelson"
+date: "11/30/2018"
+output: html_document
+---
+
+This file contains models examining the functional relationship between agricultural landscape diversity and agricultural yields. This work applies hierachical Bayesian spatiotemporal modeling techniques to estimation of the effect of diversity of the agricultural landscape on the yield of corn, soy, and winter wheat. 
+
+```{r setup, include=FALSE, cache=T}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(comment = NA)
+library(ggplot2)
+library(dplyr)
+library(sf)
+library (INLA)
+library(raster)
+library(sp)
+library(spdep)
+library(rgeos)
+library(ggpubr)
+library(knitr)
+library(doParallel)
+
+```
+
+
+
+```{r readdat, echo=FALSE, warnings=F, messages=F, comment=NA, cache=T}
+#Read in datasets 
+
+    wd<-getwd()
+
+    cnty<-readRDS(paste0(wd,"/county.RDS"))
+    projection<-cnty@proj4string@projargs
+    cnty<-st_as_sf(cnty)
+    cnty<-cnty[,c(5,11)] 
+    
+    AER<-readRDS(paste0(wd,"/us_eco_l3.rds"))
+    AER<-st_as_sf(AER)
+    AER<-st_transform(AER,projection)
+    AER$AERCODE<-seq(1:length(AER$US_L3CODE))
+    AER<-AER[,"AERCODE"]
+    
+    d<-readRDS(paste0(wd, "/fullpanelnew_reg.rds"))
+    d <- d %>% filter(YEAR < 2017) %>% filter(YEAR > 2009) #this is an optional subset select that removes years for which we might not have a full growing season of data for winter wheat
+    
+
+```
+
+##REPRESENTING SPACE 
+The yield data available is at a county scale and the distribution of yields across space exhibits strong autocorrelation where yields in neighboring counties are more alike than yields in distant counties. This spatial autocorrelation is accounted for using a standard Conditional Autoreggressive dependency model based on adjacency for all counties in the conterminous US. In order to account for additional county-specific factors that contribute to yields a county iid random effect term is also included, yielding a Besag-York-Mollie (BYM) spatial dependency model. A county adjacency matrix is created for each crop under investigation. For regional models a seperate county adjacency matrix for each region-crop combination is created.
+
+
+```{r adjacency, echo=F, warnings=F, messages=F, comment=NA, cache = T}
+
+
+prep_adjacency<-function(data, crop){
+
+  df<-data
+##build list of counties growing crop of interest
+   d_crop<-df[df$CROP == crop & !is.na(df$YIELD),] #extract data for crop of interest for location-times when production occured
+    names<-unique(d_crop$GEOID)
+  
+##clip county file to cropproducing areas and setup indexing by CNTY
+  cnty_dup<-cnty #save a copy of county file for later use
+  cnty<-cnty[cnty$GEOID %in% names,] #subset to cnty growing crop
+  cnty <- cnty[order(cnty$GEOID),] #order dataset by county
+  cnty$CNTY<- seq(1,length(cnty$GEOID),1)##build group index that corresponds to adjacency matrix
+  cnty_crop<-cnty #save a copy of the crop producing counties file for building the relational matrix
+  st_geometry(cnty)<-NULL#remove geometry
+  d_crop<-left_join(d_crop,cnty[,c("GEOID","CNTY")],by="GEOID")#join new index to crop dataset
+  d_crop<-d_crop[order(d_crop$CNTY, d_crop$YEAR),]#Ordering dataset by county then time for modeling as is done in the Ohio example in chapter 7 of r-inla book (Blangiardo, M., & Cameletti, M. (2015). Spatial and spatio-temporal Bayesian models with R-INLA. John Wiley & Sons.) 
+ 
+##Build the relational matrix for areas of interest
+    cnty_crop<-as(cnty_crop,"Spatial")#convert county sf to spatial polygons for inla relation matrix
+    temp <- poly2nb(cnty_crop, queen=F) #create neighbors list from polygon object, neighbors share one or more points at boundary
+    #temp <- poly2nb(shp, queen=T)#neighbors must share more than one point at boundary
+    H.adj <- nb2mat(temp, style ="B",zero.policy=TRUE ) #convert to a sparse matrix to reduce memory (neighbor list to binary coded neighbor weights matrix)
+    H.adj <-as(H.adj, "dgTMatrix") #convert to a sparse style matrix
+   saveRDS(H.adj, paste0(wd,"/output/","H.adj.", crop,".rds"))
+   
+
+##Add AER index
+  
+  names<-unique(d_crop$AERCODE)#extract names of AERs for crop of interest for location-times when production occured
+  AER_dup<-AER #save a copy of county file for later use
+  AER<-AER[AER$AERCODE %in% names,] #subset to AERs where production occurs
+  AER$AER_ID<-AER$AERCODE #rename the original AER identification code (AER_ID is now the orignal identifier)
+  AER <- AER[order(AER$AER_ID),] #order dataset by AER
+  AER$AERCODE<- seq(1,length(AER$AERCODE),1)##build group index that corresponds to adjacency matrix
+  AER_crop<-AER #save a copy of the crop producing counties file for building the relational matrix
+  st_geometry(AER)<-NULL#remove geometry
+  d_crop<-rename(d_crop,AER_ID=AERCODE)#switch to use of AER_ID as the original AER identifcation as done above
+  d_crop<-left_join(d_crop,AER[,c("AERCODE","AER_ID")],by="AER_ID")#join new index (AERCODE) to crop dataset by the original identifier(AER_ID)
+  d_crop<-d_crop[order(d_crop$AERCODE, d_crop$YEAR),]#Ordering dataset by location then time 
+  
+#save crop dataset with indexes
+  saveRDS(d_crop, paste0(wd,"/output/d_", crop,".rds"))
+}
+
+#build and read crop specific dataset and adjacency matrix
+  prep_adjacency(d,"corn")
+  d_corn<-readRDS(paste0(wd,"/output/d_corn.rds"))
+  H.adj.corn<-readRDS(paste0(wd,"/output/","H.adj.corn.rds"))
+  #plot spatial object
+    image(inla.graph2matrix(H.adj.corn), xlab="", ylab="")
+    
+  prep_adjacency(d,"soy")
+  d_soy<-readRDS(paste0(wd,"/output/d_soy.rds"))
+  H.adj.soy<-readRDS(paste0(wd,"/output/","H.adj.soy.rds"))
+  #plot spatial object
+    image(inla.graph2matrix(H.adj.soy), xlab="", ylab="")
+    
+  prep_adjacency(d,"wwheat")
+  d_wwheat<-readRDS(paste0(wd,"/output/d_wwheat.rds"))
+  H.adj.wwheat<-readRDS(paste0(wd,"/output/","H.adj.wwheat.rds"))
+  #plot spatial object
+    image(inla.graph2matrix(H.adj.wwheat), xlab="", ylab="")
+    
+    
+```
+
+
+
+
+```{r define_fcns, echo=F, warnings=F, messages=F, comment=NA, cache=T}
+
+## DEFINE FUNCTIONS
+
+# Setup some basic functions to run models and provide model results, diagnostics, and plots. 
+
+run.model<-function(formula, data, crop, name){
+  df<-data[data$CROP %in% crop,] #define the dataset for the crop of interest
+  #y<-df$YIELD #specify the dependent variable
+  OUT<-inla(formula, data=df, family = "gaussian",     
+          control.predictor = list( compute=TRUE), control.compute=list(dic=TRUE, cpo=TRUE), control.fixed = list(prec = 0.0000001)) #run the inla model
+  saveRDS(OUT, file=paste0(wd,"/output/",name ,".rds")) #save the model output
+}
+
+model.results<-function(model_results_name, data="d", crop="corn", diagnostics = TRUE){
+  results<-readRDS(paste0(wd,"/output/",model_results_name,".rds"))
+  data<-data[data$CROP %in% crop,] #subset data by crop of interest
+  data<-as.data.frame(data)
+  summary<-summary(results)
+  if (diagnostics == TRUE){ #if diagnostics turned on return the dic, cpo, and pit
+    #R_INLA Diagnostics
+    DIC<-(results$dic$dic)
+    CPO<-(sum(log(results$cpo$cpo), na.rm=T)) 
+    h<-ggplot(as.data.frame(results$cpo$pit), aes(x=results$cpo$pit)) + geom_histogram() + ggtitle( "Model PIT")
+    #PPC Distribution Checks
+    p_val<-c()
+    n<-length(data$YIELD)
+    for(i in (1:n)){
+      p_val[i]<-inla.pmarginal(q=data$YIELD[i],
+                               marginal=results$marginals.fitted.values[[i]])
+    }
+    data<-cbind(data,results$summary.fitted.values$mean)
+    colnames(data)[dim(data)[2]]<-c("FittedVals")
+    dat<-select_at(data, c("YIELD","FittedVals")) %>% mutate_all(.,funs(exp))
+     p1<-ggplot(as.data.frame(dat[!is.na(dat$YIELD),]), aes(x=YIELD,y=FittedVals)) + geom_point(size=0.2, color="blue") +
+      ggtitle("Scatter Plot of Predicted and Observed Values")  + xlab("Observed Value") + ylab("Mean of Post. Pred. Distr.")
+  
+    p2<-ggplot(as.data.frame(p_val), aes(x=p_val)) + geom_histogram() + ggtitle("Posterior Predictive p-values")
+    
+    #PPC Summary Metrics
+    sq_dif<-(data$YIELD-data$FittedVals)^2
+    MSE<-1/n*(sum(sq_dif,na.rm=T))
+    
+    pred_res2<-(data$FittedVals[!is.na(data$YIELD)] - mean(data$YIELD, na.rm=T)) ^2
+    obs_res2<-(data$YIELD[!is.na(data$YIELD)] - mean(data$YIELD, na.rm=T))^2
+    R2<-sum(pred_res2, na.rm=T)/sum(obs_res2, na.rm=T)
+    
+    #OUPUTS
+    summtable<-as.data.frame(summary$fixed[,1:5])
+    summtable.pt2<-as.data.frame(summary$hyperpar[,1:5])
+    summtable<-rbind(summtable,summtable.pt2)
+    summtable<-kable(summtable, caption="Summary Table of Model Estimates")
+    
+    Diagnostics<-as.data.frame(t(c(DIC,CPO,MSE,R2)))
+    colnames(Diagnostics)<-c("DIC","CPO","MSE","R2")
+    Diagnostics<-kable(Diagnostics, caption="Model Diagnostic Metrics")
+    
+    figure<-ggarrange(h,p1,p2,ncol=3,nrow=1)
+    annotate_figure(figure, top= text_grob("Model Diagnostic Plots"))
+    
+    my_list<-list(summtable,  figure, Diagnostics)
+  return(my_list)
+  }  
+  my_list<-list(summary)
+  return(my_list)
+}
+
+
+crossval.randho<-function(model_results_name, formula= "formula", data="d", crop="corn", n=1/7){
+#using a completely random hold-out sample works better than holding out an entire year as we retain enough info to have reliable random effects
+d_ho<-data
+
+#select random subset to withhold from evaluation if you have not already done so
+if (!file.exists(paste0(wd,"/output/hoidx_",model_results_name,".rds"))){ 
+     idx<-sample(seq(1:length(d_ho$YIELD)), length(d_ho$YIELD)*n) #1/7 sample
+    saveRDS(idx,paste0(wd,"/output/hoidx_",model_results_name,".rds"))}
+
+idx<-readRDS(paste0(wd,"/output/hoidx_",model_results_name,".rds"))
+
+#build the subset for evaluation
+d_ho$YIELD[idx]<-NA
+
+if (!file.exists(paste0(wd,"/output/",model_results_name,".rds"))){ 
+      run.model(formula, d_ho,crop,model_results_name)
+}
+
+      df<-st_as_sf(data)
+      results<-readRDS(paste0(wd,"/output/",model_results_name,".rds"))
+  
+      df<-cbind(df,results$summary.fitted.values$mean)
+      df$error<-df$YIELD-df$results.summary.fitted.values.mean
+      #hist(data$error)
+      
+      #MSE and R2 for held-out sample 
+     df_sub<-df[idx,]
+     n<-length(df_sub$YIELD)
+     df_sub<-df_sub[df_sub$error<10,]
+     cnt_outliers<-length(df_sub[df_sub$error<10,1])#i remove two outliers that doubles the predicted residuals, upon examination the extremely low predicted yield (close to zero after back transformed seems to be due in part to discrepant TP values 
+  
+     
+    sq_dif<-(df_sub$error)^2
+    MSE<-1/n*(sum(sq_dif,na.rm=T))
+    
+    pred_res2<-(df_sub$results.summary.fitted.values.mean [!is.na(df_sub$YIELD)] - mean(df_sub$YIELD, na.rm=T)) ^2
+    obs_res2<-(df_sub$YIELD[!is.na(df_sub$YIELD)] - mean(df_sub$YIELD, na.rm=T))^2
+    R2<-sum(pred_res2, na.rm=T)/sum(obs_res2, na.rm=T)
+    Gelman_R2<-(sum(pred_res2)/(sum(pred_res2)+sum(sq_dif)))
+    NSE<-1-(sum(sq_dif,na.rm=T)/sum(obs_res2, na.rm=T))
+    
+    Cross_Val_Metrics<-as.data.frame(t(c(R2,MSE,NSE, cnt_outliers)))
+    colnames(Cross_Val_Metrics)<-c("R2","MSE","NSE","OutlierCount")
+    saveRDS(Cross_Val_Metrics, paste0(wd,"/output/cv_",model_results_name,".rds"))
+    Cross_Val_Metrics<-kable(Cross_Val_Metrics, caption="Cross Validation Diagnostic Metrics")
+    
+    return(Cross_Val_Metrics)
+}
+
+
+plot.spatialeffect<-function(model_results_name, data, crop, type ="BYM", scale="CNTY"){
+  df<-data[data$CROP %in% crop,] #subset data by crop of interest
+  df<-st_as_sf(df)
+  results<-readRDS(paste0(wd,"/output/",model_results_name,".rds"))
+  
+  if (type =="BYM"){ #Spatial effect for bym models
+    if (scale =="CNTY"){ #County spatial effects
+      Nareas<-length(unique(df$CNTY)) #number of unique spatial locations in dataset
+      asr<-results$summary.random$CNTY[1:Nareas,c(1,2,3)]#extract the area-specific residuals
+    
+      #Create spatial dataframe with information for map 
+      map.asr<-left_join(df[,c("CNTY","GEOID","geometry")],asr,by=c("CNTY"="ID"))
+      #map.asr<-map.asr[,c(-1)]
+      colnames(map.asr)<-c("CNTY","GEOID","Mean","Standard_Deviation","geometry")
+            #plot(map.asr, main= "Area Specific Residuals"
+      saveRDS(map.asr,paste0(wd,"/output/",model_results_name,"_asr.rds"))
+     
+     #calculate spatially structured variance if using BYM
+          # mat.marg <-matrix(NA, nrow=Nareas,ncol=100000)
+          # m<-results$marginals.random$CNTY
+          # for (i in 1:Nareas){
+          #   u<- m[[Nareas+i]]
+          #   mat.marg[i,]<-inla.rmarginal(100000,u)
+          # }
+          # var.u<-apply(mat.marg,2,var)
+          # 
+          # 
+          # #fraction of area effect that is iid structured
+          # var.v<-inla.rmarginal(100000,inla.tmarginal (function(x) 1/x, results$marginals.hyperpar$`Precision for CNTY (iid component)`)) 
+          #   #var.u<-inla.rmarginal(100000,inla.tmarginal (function(x) 1/x, results$marginals.hyperpar$`Precision for CNTY (spatial component)`)) #using this                   gives nearly the same results as the rmarginal approach
+          # 
+          # 
+          # #compute spatial fraction of variance
+          # perc.var.u<-mean(var.u/(var.u+var.v))
+      
+    #Report proportion of variance that is spatially structured if using BYM2
+      perc.var.u<-round(results$summary.hyperpar["Phi for CNTY","0.5quant"], digits=4) 
+     
+  #Plot spatial effects 
+     require(viridis)
+      p1 <- ggplot() +
+      geom_sf(data = map.asr, color = "white", size = 0.05, aes(fill = Mean)) +
+        ggtitle(paste("Mean of Area Specific Residuals for", model_results_name)) +
+        theme_minimal() + scale_fill_viridis(option = "magma")
+      p1<-annotate_figure(p1, bottom = text_grob(paste0("Fraction of variance that is spatially structured:", perc.var.u)))
+        
+        
+      # p1<-plot(map.asr[,3], main= paste("Mean of Area Specific Residuals for", model_results_name), lwd=0.5, key.pos=1)
+      #          mtext(paste0("Fraction of variance that is spatially structured:", perc.var.u), side=1) 
+      # p1<-print(p1)
+      
+      p2 <- ggplot() +
+        ggtitle(paste0("Standard Deviation of Area Specific Residuals for", model_results_name)) +
+      geom_sf(data = map.asr, color = "white", size = 0.05, aes(fill = Standard_Deviation)) +
+        theme_minimal() + scale_fill_viridis(option = "magma")
+      
+      # p2<-plot(map.asr[,4], main=paste("Standard Deviation of Area Specific Residuals for", model_results_name), lwd=0.5, key.pos=1)
+      # p2<-print(p2)
+      
+      #my_list<-list(p1,p2,"Fraction of Area Residuals that is Spatially Structured", perc.var.u)
+      my_list<-list(p1,p2)
+      
+      return (my_list)
+    }
+    
+     
+  }
+    
+}
+
+
+
+plot.smootheffect<-function(model_results_name, var="SDI"){
+  
+   results<-readRDS(paste0(wd,"/output/",model_results_name,".rds"))
+   
+   if(var=="SDI"){
+        
+        p2<-ggplot(data=results$summary.random$SDI[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+   }
+   
+   if(var=="SIDI"){
+        
+        p2<-ggplot(data=results$summary.random$SIDI[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+   }
+     if(var=="RICH"){
+        
+        p2<-ggplot(data=results$summary.random$RICH[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+   }
+   if(var=="TP"){
+     
+        p2<-ggplot(data=results$summary.random$TP[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))  
+
+   }
+   if(var=="EfP"){
+       
+        p2<-ggplot(data=results$summary.random$EfP[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))  
+
+   }
+     if(var=="ExP"){
+       
+        p2<-ggplot(data=results$summary.random$ExP[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+     }
+     if(var=="GDD"){
+       
+        p2<-ggplot(data=results$summary.random$GDD[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2))
+
+     }
+     if(var=="SDD"){
+       
+        p2<-ggplot(data=results$summary.random$SDD[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2)) 
+   
+     }
+    if(var=="Yr"){
+       
+        p2<-ggplot(data=results$summary.random$Yr[ ,c(1,4,5,6)], aes (x=ID, y=`0.5quant`)) + geom_point() +
+          geom_line(aes(x=ID, y=`0.025quant`, col="red")) + geom_line(aes(x=ID, y=`0.975quant`, col="red")) + 
+          theme(legend.position="none")+ xlab(var) + ggtitle(paste("Smooth Effect for", var, model_results_name))
+        return(list(p2)) 
+     
+   }
+  
+  
+}
+
+plot.us<-function(directory, metrics, crops, landscape, climatevars, subplot.labels, y.min, y.max, x.min, x.max){
+      
+      metrics.labels<-toupper(metrics)
+      crops.labels<-crops
+      crops.labels[crops.labels == "wwheat"] <- "Winter wheat" 
+      crops.labels[crops.labels == "corn"] <- "Corn" 
+      crops.labels[crops.labels == "soy"] <- "Soy"
+      
+      n<-length(climatevars)
+      registerDoParallel(n)
+      my.plots<-c()
+      getDoParWorkers() 
+      
+      foreach(j=1:n, .packages="ggplot2") %dopar% {
+      my.plots<-c()
+      
+      for (i in 1:length(metrics)){
+        
+        #pull the model output by metric for ag diversity
+        results_1<-readRDS(paste0(directory , metrics[i], "_us_", crops[1], "_", landscape,".rds"))
+        results_2<-readRDS(paste0(directory , metrics[i], "_us_", crops[2], "_",landscape,".rds"))
+        results_3<-readRDS(paste0(directory , metrics[i], "_us_", crops[3], "_",landscape,".rds"))
+        
+        
+        #pull the results for the effect of the metric
+        results_1a<-get(climatevars[j],results_1$summary.random)[ ,c(1,4,5,6)]
+        results_2a<-get(climatevars[j],results_2$summary.random)[ ,c(1,4,5,6)]
+        results_3a<-get(climatevars[j],results_3$summary.random)[ ,c(1,4,5,6)]
+        
+        #add crop column
+        results_1a$Crop<-crops.labels[1]
+        results_2a$Crop<-crops.labels[2]
+        results_3a$Crop<-crops.labels[3]
+        
+        #combine data for a single plot
+        results_tot<-as.data.frame(rbind(results_1a,results_2a,results_3a))
+        results_tot$ClimateVars<-climatevars[j]
+        
+        #build a plot
+        #group.colors<-c("corn" ="#F8766D","soy" ="#00BA38", "winter wheat" ="#619CFF")
+        p1<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Crop, col=Crop), size=1) + 
+         # scale_colour_manual(values=group.colors)+
+          xlim(x.min[j], x.max[j]) + ylim(y.min[j],y.max[j]) + 
+          xlab(paste0(climatevars[j])) + ylab("Effect on log(Yield)") + ggtitle (metrics.labels[i]) +
+          geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Crop, fill=Crop), alpha=0.25) +
+         # scale_fill_manual(values=group.colors)+
+          theme_classic()
+        
+        my.plots[[i]]<-p1
+        
+        }
+        return(my.plots)
+      }
+      }
+    
+
+
+```
+
+
+##MODELS
+
+
+The model form is a random-effects panel model with county spatial effects, non-parametric SDI, non-parametric Temp and Precip controls, and a quadratic time trend (similar to Schlenker and Roberts, 2009) for each agro-eco-region. The spatial effects account for standard, unstructured or iid, county random effects (deviation of the county mean from the population mean) as well as conditional autogregressive (CAR) structured residuals between counties. These effects account for time-invariant factors that differ across counties (however assume that the effects are not correlated with errors hence do not fully account for potential ommitted variables). The quadratic time trends for each agro-eco-region account for factors that are space-invariant (within an agro-eco-region) and vary across time (without the overfitting that was observed with the use of the rw2 random time effects). This effect is intended to account for factors that produce  changes over time, but that may differ across agro-eco-regions. These effects are expected to partially account for differences in technology use and adoption rates over time in different regions and differences in agricultural management styles and techniques across regions that result in temporally varying responses to climate conditions. Note that while there clearly are differences in management styles, climate responses, and technology use within agro-eco-regions these effects account for aspects of the agro-eco-region as a whole that constrain or enable certain types of actions. 
+
+formula<-YIELD ~ 1 + f(TP, model="rw1",scale.model=T) + f(SDD,model="rw1",scale.model=T)  + f(GDD,model="rw1", scale.model=T) +
+  f(SDI, model="rw1", scale.model=T)+ PERC_IRR + ACRES   + f(CNTY, model="bym", graph=H.adj.corn, scale.model=TRUE) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+  
+Previous models employed r-inla default prior settings for the random effects and used a reduced precision fixed effect prior. This round of models keeps the reduced precision fixed effect prior and further employs penalized complexity priors (https://arxiv.org/pdf/1403.4630v4.pdf) that use a scaling factor to specify priors based on the limits of the data creating a weakly informative prior. Default and recomended settings for PC priors as provided in the R-INLA documentation and in https://arxiv.org/pdf/1403.4630v4.pdf are employed. These models also employ sum-to-zero constraints for all random effects(https://link.springer.com/article/10.1007%2Fs00477-017-1405-0). 
+
+
+
+#ABOUT DIAGNOSTICS
+
+ In the returned model ouputs several diagnostics are reported. Some of these diagnostics are computed by R-INLA, and additional posterior predicve and cross-validation checks were manually computed. Descriptions of the diagnostics are adapted from Spatial and Spatio-temporal Bayesian Models with R-INLA (2015) by Blangiardo and Cameletti. 
+ 
+ * The deviance information criterion (DIC) is a generalization of the AIC (Akaike information criterion) developed for Bayesian model comaprison that examines tradeoffs between model fit (log-likelihood) and model complexity (effective number of parameters). Models with smaller DIC are better supported by the data. 
+ 
+ * The conditional predictive ordinate (CPO) is a leave-one-out-cross-validation diagnostic that estimates the probability of observing a value in the predictive distribution given a model fitted to all the observed data except that value. Larger values of CPO indicate a better model fit. 
+ 
+ * The probability integral transform (PIT) is another leave-one-out-cross-validation check that evaluates the predictive performance of the model where a Uniform distribution of PIT means the predictive distribution matches well with the data. 
+ 
+Manually calculated posterior predictive checks (PPC) were obtained using the predictive distribution estimated by R-INLA. These checks use all observations for both model evaluation and predictive checks (hence are not a form of cross-validation). 
+
+* The first PPC shows a scatterplot of the posterior means for the predictive distribution and observed values, where points scattered along a line of slope 1 indicates a very good fit. 
+
+* The second PPC provides a histogram of the posterior predictive p-value which estimates the probability of predicting a value more extreme than the observed value, where values near 0 and 1 indicate that the model does not adequately account for the tails of the observed distribution. The tails are due to isolated county-year events which seem to correspond with disaster records.
+
+* The final two PPC metrics calucalted provide the mean squared error (MSE) and R squared (R2) between the observed and predicted data (Blangiardo and Cameletti, 2015, page 168).
+
+In addition, an independent cross-validation model was run using 6/7ths of the data for model fit estimation and reserving a held-out sample of 1/7th of the data
+for comparison. Three diagnostic metrics (MSE, R2, and NSE) were calculated for the cross-validation models. As a smaller sample size is used for these caluculations they are more sensitive to outliers than the previously reported diagnostics. Therefore, outlier error values greater than twice the mean of the observed data were removed prior to calculation of these diagnostics and the count of outliers is also reported.
+
+* The mean squared error (MSE) and R squared (R2) between the held-out data and predicted data were calculated (Blangiardo and Cameletti, 2015, page 168). 
+
+* The Nash Sutcliffe Efficiency (NSE) which is commonly used to assess the predictive power of hydrological models was computed. A value of 0 indicates that the mean of the observed data is as good a predictor as the model, values less than 0 indicate the model is a poorer preditor than the mean of the data, and a value of 1 indicates that the model perfectly predicts the observed data. 
+
+
+  
+##US EXTENTS CORN MODELS 
+
+
+This section estimates the model described above for corn for three metrics of agricultural landscape diversity (SIDI, SDI, and RICH). Model estimates, diagnostics, functional response plots, and maps of spatial effects are all reported.
+
+```{r corn, echo=F, warning=F, message=F, comment=NA, cache=T}
+d_corn$SDI<-d_corn$SDI_AG
+d_corn$SIDI<-d_corn$SIDI_AG
+d_corn$RICH<-d_corn$RICH_AG
+
+#SDI binned to nearest 0.01
+d_corn$SIDI<-round(d_corn$SIDI,2)
+#SDI binned to nearest 0.1
+d_corn$SDI<-round(d_corn$SDI,1)
+#TP, GDD binned to nearest 100
+d_corn$TP<-round(d_corn$TP,-2)
+d_corn$GDD<-round(d_corn$GDD,-2)
+#SDD binned to nearest 10
+d_corn$SDD<-round(d_corn$SDD,-1)
+#Yield transformed to log(Yield)
+d_corn$YIELD<-log(d_corn$YIELD)
+
+#Additional identifiers
+d_corn$AERCODE.id<-d_corn$AERCODE
+d_corn$YEAR.id<-d_corn$Yr  #so index starts at 1
+d_corn$YEAR.id2<-(d_corn$Yr )^2
+d_corn$AERCODE.id2<-d_corn$AERCODE
+
+#setup pc priors
+  v=sd(d_corn$YIELD,na.rm=TRUE)
+  n=dim(d_corn)[1]
+  Q = INLA:::inla.pc.bym.Q(H.adj.corn)
+  Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))
+  u = 0.2/0.31
+  alpha = 0.01
+  phi.u = 0.5
+  phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha
+  phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+####SIDI
+               
+formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.corn, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+               
+          #run.model(formula, d_corn,"corn","sidi_us_corn_ag")
+        model.results("sidi_us_corn_ag", d_corn,"corn", diagnostics=TRUE)
+        plot.spatialeffect("sidi_us_corn_ag", d_corn,"corn")
+        plot.smootheffect("sidi_us_corn_ag", var="SIDI")
+        plot.smootheffect("sidi_us_corn_ag", var="TP")
+        plot.smootheffect("sidi_us_corn_ag", var="SDD")
+        plot.smootheffect("sidi_us_corn_ag", var="GDD")
+        crossval.randho("sidi_us_corn_ag_ho", formula, d_corn, "corn", n=1/7)
+          
+        
+#####SDI        
+           
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.corn, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+          
+          
+         # run.model(formula, d_corn,"corn","sdi_us_corn_ag")
+         model.results("sdi_us_corn_ag", d_corn,"corn", diagnostics=TRUE)
+        plot.spatialeffect("sdi_us_corn_ag", d_corn,"corn")
+        plot.smootheffect("sdi_us_corn_ag", var="SDI")
+        plot.smootheffect("sdi_us_corn_ag", var="TP")
+        plot.smootheffect("sdi_us_corn_ag", var="SDD")
+        plot.smootheffect("sdi_us_corn_ag", var="GDD")
+        crossval.randho("sdi_us_corn_ag_ho", formula, d_corn, "corn", n=1/7)
+          
+#####RICH        
+          
+         formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.corn, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2) 
+
+          #run.model(formula, d_corn,"corn","rich_us_corn_ag")
+        model.results("rich_us_corn_ag", d_corn,"corn", diagnostics=TRUE)
+        plot.spatialeffect("rich_us_corn_ag", d_corn,"corn")
+        plot.smootheffect("rich_us_corn_ag", var="RICH")
+        plot.smootheffect("rich_us_corn_ag", var="TP")
+        plot.smootheffect("rich_us_corn_ag", var="SDD")
+        plot.smootheffect("rich_us_corn_ag", var="GDD")
+       crossval.randho("rich_us_corn_ag_ho", formula, d_corn, "corn", n=1/7)
+       
+ ####Model without diversity for building spatial effects that do not account for diversity for bivariate Yield, Diversity maps   
+        
+        formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.corn, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+               
+          #run.model(formula, d_corn,"corn","climate_us_corn_ag")
+        # model.results("climate_us_corn_ag", d_corn,"corn", diagnostics=TRUE)
+        # plot.spatialeffect("climate_us_corn_ag", d_corn,"corn")
+          
+```
+
+
+##US EXTENTS SOY MODELS 
+
+
+
+This section estimates the model described above for soy for three metrics of agricultural landscape diversity (SIDI, SDI, and RICH). Model estimates, diagnostics, functional response plots, and maps of spatial effects are all reported.
+```{r soy2, echo=F, warning=F, message=F, comment=NA, cache=T} 
+
+d_soy$SDI<-d_soy$SDI_AG
+d_soy$SIDI<-d_soy$SIDI_AG
+d_soy$RICH<-d_soy$RICH_AG
+
+#SIDI binned to nearest 0.01
+d_soy$SIDI<-round(d_soy$SIDI,2)
+#SDI binned to nearest 0.1
+d_soy$SDI<-round(d_soy$SDI,1)
+#TP, GDD binned to nearest 100
+d_soy$TP<-round(d_soy$TP,-2)
+d_soy$GDD<-round(d_soy$GDD,-2)
+#SDD binned to nearest 10
+d_soy$SDD<-round(d_soy$SDD,-1)
+#Yield transformed to log(Yield)
+d_soy$YIELD<-log(d_soy$YIELD)
+
+#Additional identifiers
+d_soy$AERCODE.id<-d_soy$AERCODE
+d_soy$YEAR.id<-d_soy$Yr #so index starts at 1  
+d_soy$YEAR.id2<-(d_soy$Yr)^2
+d_soy$AERCODE.id2<-d_soy$AERCODE
+
+#setup pc priors
+v=sd(d_soy$YIELD,na.rm=TRUE)
+n=dim(d_soy)[1]
+Q = INLA:::inla.pc.bym.Q(H.adj.soy)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+        formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.soy, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+
+          #run.model(formula, d_soy,"soy","sidi_us_soy_ag")
+        model.results("sidi_us_soy_ag", d_soy,"soy", diagnostics=TRUE)
+        plot.spatialeffect("sidi_us_soy_ag", d_soy,"soy")
+        plot.smootheffect("sidi_us_soy_ag", var="SIDI")
+        plot.smootheffect("sidi_us_soy_ag", var="TP")
+        plot.smootheffect("sidi_us_soy_ag", var="SDD")
+        plot.smootheffect("sidi_us_soy_ag", var="GDD")
+         crossval.randho("sidi_us_soy_ag_ho", formula, d_soy, "soy", n=1/7)
+        
+
+          
+          
+           formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.soy, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+
+         # run.model(formula, d_soy,"soy","sdi_us_soy_ag")
+        model.results("sdi_us_soy_ag", d_soy,"soy", diagnostics=TRUE)
+        plot.spatialeffect("sdi_us_soy_ag", d_soy,"soy")
+        plot.smootheffect("sdi_us_soy_ag", var="SDI")
+        plot.smootheffect("sdi_us_soy_ag", var="TP")
+        plot.smootheffect("sdi_us_soy_ag", var="SDD")
+        plot.smootheffect("sdi_us_soy_ag", var="GDD")
+        crossval.randho("sdi_us_soy_ag_ho", formula, d_soy, "soy", n=1/7)
+        
+           formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.soy, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+
+          #run.model(formula, d_soy,"soy","rich_us_soy_ag")
+        model.results("rich_us_soy_ag", d_soy,"soy", diagnostics=TRUE)
+        plot.spatialeffect("rich_us_soy_ag", d_soy,"soy")
+        plot.smootheffect("rich_us_soy_ag", var="RICH")
+        plot.smootheffect("rich_us_soy_ag", var="TP")
+        plot.smootheffect("rich_us_soy_ag", var="SDD")
+        plot.smootheffect("rich_us_soy_ag", var="GDD")
+         crossval.randho("rich_us_soy_ag_ho", formula, d_soy, "soy", n=1/7)
+        
+                   
+         ##MODEL without diversity
+ formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.soy, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+
+          #run.model(formula, d_soy,"soy","climate_us_soy_ag")
+        # model.results("climate_us_soy_ag", d_soy,"soy", diagnostics=TRUE)
+        #  plot.spatialeffect("climate_us_soy_ag", d_soy,"soy")
+
+
+```     
+
+
+##US EXTENTS WINTER WHEAT MODELS 
+
+
+This section estimates the model described above for winter wheat for three metrics of agricultural landscape diversity (SIDI, SDI, and RICH). Model estimates, diagnostics, functional response plots, and maps of spatial effects are all reported.   
+```{r winterwheat2, echo=F, warning=F, message=F, comment=NA, cache=T}
+d_wwheat$SDI<-d_wwheat$SDI_AG
+d_wwheat$SIDI<-d_wwheat$SIDI_AG
+d_wwheat$RICH<-d_wwheat$RICH_AG
+
+#SIDI binned to nearest 0.01
+d_wwheat$SIDI<-round(d_wwheat$SIDI,2)
+#SDI binned to nearest 0.1
+d_wwheat$SDI<-round(d_wwheat$SDI,1)
+#TP, GDD binned to nearest 100
+d_wwheat$TP<-round(d_wwheat$TP,-2)
+d_wwheat$GDD<-round(d_wwheat$GDD,-2)
+#SDD binned to nearest 10
+d_wwheat$SDD<-round(d_wwheat$SDD,-1)
+#Yield transformed to log(Yield)
+d_wwheat$YIELD<-log(d_wwheat$YIELD)
+
+#Additional identifiers
+d_wwheat$AERCODE.id<-d_wwheat$AERCODE
+d_wwheat$YEAR.id<-d_wwheat$Yr  #so index starts at 1    
+d_wwheat$YEAR.id2<-(d_wwheat$Yr)^2
+d_wwheat$AERCODE.id2<-d_wwheat$AERCODE
+
+
+#Setup pc priors
+v=sd(d_wwheat$YIELD,na.rm=TRUE)
+n=dim(d_wwheat)[1]
+Q = INLA:::inla.pc.bym.Q(H.adj.wwheat)
+Q = INLA:::inla.scale.model(Q, constr=list(A=matrix(1, 1, n), e=0))
+u = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha
+phi.prior = INLA:::inla.pc.bym.phi(Q=Q, u= phi.u, alpha = phi.alpha)
+
+
+         formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SIDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.wwheat, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+
+         # run.model(formula, d_wwheat,"wwheat","sidi_us_wwheat_ag")
+        model.results("sidi_us_wwheat_ag", d_wwheat,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("sidi_us_wwheat_ag", d_wwheat,"wwheat")
+        plot.smootheffect("sidi_us_wwheat_ag", var="SIDI")
+        plot.smootheffect("sidi_us_wwheat_ag", var="TP")
+        plot.smootheffect("sidi_us_wwheat_ag", var="SDD")
+        plot.smootheffect("sidi_us_wwheat_ag", var="GDD")
+         crossval.randho("sidi_us_wwheat_ag_ho", formula, d_wwheat, "wwheat", n=1/7)
+          
+            formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDI, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.wwheat, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+
+          #run.model(formula, d_wwheat,"wwheat","sdi_us_wwheat_ag")
+        model.results("sdi_us_wwheat_ag", d_wwheat,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("sdi_us_wwheat_ag", d_wwheat,"wwheat")
+        plot.smootheffect("sdi_us_wwheat_ag", var="SDI")
+        plot.smootheffect("sdi_us_wwheat_ag", var="TP")
+        plot.smootheffect("sdi_us_wwheat_ag", var="SDD")
+        plot.smootheffect("sdi_us_wwheat_ag", var="GDD")
+         crossval.randho("sdi_us_wwheat_ag_ho", formula, d_wwheat, "wwheat", n=1/7)
+          
+           formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(RICH, model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.wwheat, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+
+         # run.model(formula, d_wwheat,"wwheat","rich_us_wwheat_ag")
+         model.results("rich_us_wwheat_ag", d_wwheat,"wwheat", diagnostics=TRUE)
+        plot.spatialeffect("rich_us_wwheat_ag", d_wwheat,"wwheat")
+        plot.smootheffect("rich_us_wwheat_ag", var="RICH")
+        plot.smootheffect("rich_us_wwheat_ag", var="TP")
+        plot.smootheffect("rich_us_wwheat_ag", var="SDD")
+        plot.smootheffect("rich_us_wwheat_ag", var="GDD")
+         crossval.randho("rich_us_wwheat_ag_ho", formula, d_wwheat, "wwheat", n=1/7)
+         
+         
+         ##Model without Diversity
+          formula<-YIELD ~  1 + f(TP, model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+  f(SDD,model="rw1",scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01))))  + 
+  f(GDD,model="rw1", scale.model=T, hyper = list (theta = list(prior="pc.prec",param=c(v,0.01)))) + 
+   PERC_IRR + ACRES   + 
+  f(CNTY, model="bym2", graph=H.adj.wwheat, scale.model=TRUE, constr = TRUE,  
+    hyper=list( phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital=-3), 
+                prec =list(prior = "pc.prec", param = c(u,alpha), inital = 5))) +
+  f(AERCODE.id, YEAR.id)+ f(AERCODE.id2, YEAR.id2)
+
+        #   run.model(formula, d_wwheat,"wwheat","climate_us_wwheat_ag")
+        # model.results("climate_us_wwheat_ag", d_wwheat,"wwheat", diagnostics=TRUE)
+        # plot.spatialeffect("climate_us_wwheat_ag", d_wwheat,"wwheat")
+```   
+
+
+##SUMMARY PLOTS 
+
+
+Summary plots showing the effect of the smooth, random-walk, effects of diversity and climate on log(Yield) for each model. All crops are presented on a single plot, and new plots are created for different diversity metrics and different climate variables. Solid lines represent the median effect and the colored bands represent the 95% credibility limits as obtained from the estimated posterior distribution.
+
+Effect of Diversity Metrics
+
+```{r summ_plot1, echo=F, warning=F, message=F, comment=NA, cache=T}
+
+    
+plot.us<-function(directory, metrics, crops, landscape, subplot.labels, y.min, y.max, x.min, x.max){
+
+metrics.labels<-toupper(metrics)
+crops.labels<-crops
+crops.labels[crops.labels == "wwheat"] <- "Winter wheat"
+crops.labels[crops.labels == "corn"] <- "Corn"
+crops.labels[crops.labels == "soy"] <- "Soy"
+
+
+    my.plots<-c()
+
+    for (i in 1:length(metrics)){
+
+      #pull the model output by metric for ag diversity
+      results_1<-readRDS(paste0(directory , metrics[i], "_us_", crops[1], "_", landscape,".rds"))
+      results_2<-readRDS(paste0(directory , metrics[i], "_us_", crops[2], "_",landscape,".rds"))
+      results_3<-readRDS(paste0(directory , metrics[i], "_us_", crops[3], "_",landscape,".rds"))
+
+          #pull the results for the effect of the metric
+          results_1a<-get(metrics.labels[i],results_1$summary.random)[ ,c(1,4,5,6)]
+          results_2a<-get(metrics.labels[i],results_2$summary.random)[ ,c(1,4,5,6)]
+          results_3a<-get(metrics.labels[i],results_3$summary.random)[ ,c(1,4,5,6)]
+
+          #add crop column
+          results_1a$Crop<-crops.labels[1]
+          results_2a$Crop<-crops.labels[2]
+          results_3a$Crop<-crops.labels[3]
+
+          #combine data for a single plot
+          results_tot<-as.data.frame(rbind(results_1a,results_2a,results_3a))
+
+          #build a plot
+          p1<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Crop, col=Crop), size=1) +
+            xlim(x.min[i], x.max[i]) + ylim(y.min,y.max) +
+            xlab(paste0(metrics.labels[i])) + ylab("Effect on log (Yield)") + ggtitle (paste0(subplot.labels[i])) +
+            geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Crop, fill=Crop), alpha=0.25) +
+            theme_classic()
+
+      my.plots[[i]]<-p1
+
+    }
+    return(my.plots)
+}
+
+    directory<-paste0(wd, "/output/")
+    metrics<-c("sdi", "sidi", "rich")
+    crops<-c("corn", "soy", "wwheat")
+    landscape<-"ag"
+    subplot.labels<-c(NULL)
+    y.min<-(-0.2)
+    y.max<-(0.3)
+    x.max<-c(3,1,80)
+    x.min<-c(0,0.7,0)
+
+    p1<-plot.us(directory, metrics, crops, landscape, subplot.labels, y.min, y.max, x.min, x.max)
+
+
+#build a 3x1 plot by combining the output for all metrics and crops
+    figure1<-ggarrange(p1[[1]], p1[[2]] + theme( axis.title.y = element_blank()), p1[[3]] + theme( axis.title.y = element_blank()),
+                       ncol=3,nrow=1, common.legend = TRUE, legend = "bottom")
+    annotate_figure(figure1)
+
+```
+
+Effect of Climate Variables
+
+```{r summ_plot2, echo=F, warning=F, message=F, comment=NA, cache=T}
+
+#function to create a set of plots for different climate vars with multiple crops on each plot for a single landscape type
+# plot.us<-function(directory, metrics, crops, landscape, climatevars, subplot.labels, y.min, y.max, x.min, x.max){
+#       
+#       metrics.labels<-toupper(metrics)
+#       crops.labels<-crops
+#       crops.labels[crops.labels == "wwheat"] <- "Winter wheat" 
+#       crops.labels[crops.labels == "corn"] <- "Corn" 
+#       crops.labels[crops.labels == "soy"] <- "Soy"
+#       
+#       n<-length(climatevars)
+#       registerDoParallel(n)
+#       my.plots<-c()
+#       getDoParWorkers() 
+#       
+#       foreach(j=1:n, .packages="ggplot2") %dopar% {
+#       my.plots<-c()
+#       
+#       for (i in 1:length(metrics)){
+#         
+#         #pull the model output by metric for ag diversity
+#         results_1<-readRDS(paste0(directory, metrics[i], "_us_", crops[1], "_", landscape,".rds"))
+#         results_2<-readRDS(paste0(directory, metrics[i], "_us_", crops[2], "_",landscape,".rds"))
+#         results_3<-readRDS(paste0(directory, metrics[i], "_us_", crops[3], "_",landscape,".rds"))
+#         
+#         
+#         #pull the results for the effect of the metric
+#         results_1a<-get(climatevars[j],results_1$summary.random)[ ,c(1,4,5,6)]
+#         results_2a<-get(climatevars[j],results_2$summary.random)[ ,c(1,4,5,6)]
+#         results_3a<-get(climatevars[j],results_3$summary.random)[ ,c(1,4,5,6)]
+#         
+#         #add crop column
+#         results_1a$Crop<-crops.labels[1]
+#         results_2a$Crop<-crops.labels[2]
+#         results_3a$Crop<-crops.labels[3]
+#         
+#         #combine data for a single plot
+#         results_tot<-as.data.frame(rbind(results_1a,results_2a,results_3a))
+#         results_tot$ClimateVars<-climatevars[j]
+#         
+#         #build a plot
+#         #group.colors<-c("corn" ="#F8766D","soy" ="#00BA38", "winter wheat" ="#619CFF")
+#         p1<-ggplot(data=results_tot) + geom_line(aes (x=ID, y=`0.5quant`, group = Crop, col=Crop), size=1) + 
+#          # scale_colour_manual(values=group.colors)+
+#           xlim(x.min[j], x.max[j]) + ylim(y.min[j],y.max[j]) + 
+#           xlab(paste0(climatevars[j])) + ylab("Effect on log(Yield)") + ggtitle (metrics.labels[i]) +
+#           geom_ribbon(aes(x=ID,ymin = `0.025quant`, ymax = `0.975quant`, group=Crop, fill=Crop), alpha=0.25) +
+#          # scale_fill_manual(values=group.colors)+
+#           theme_classic()
+#         
+#         my.plots[[i]]<-p1
+#         
+#         }
+#         return(my.plots)
+#       }
+#       }
+#     
+#     directory<-paste0(wd, "/output/")
+#     metrics<-c("sdi", "sidi", "rich")
+#     crops<-c("corn", "soy", "wwheat")
+#     landscape<-"ag"
+#     climatevars<-c("TP","SDD","GDD")
+#     subplot.labels<-c(NULL)
+#     y.min<-c(-0.5,-1.5,-0.5)
+#     y.max<-c(0.5,1.5,1)
+#     x.max<-c(3000,1800,8500)
+#     x.min<-c(0,0,1000)
+# 
+#     p1<-plot.us(directory, metrics, crops, landscape, climatevars, subplot.labels, y.min, y.max, x.min, x.max)
+# 
+# 
+# #build a 3x2 plot by combining the climate var results for each model
+#     figure2<-ggarrange(p1[[1]][[1]], p1[[1]][[2]] + theme( axis.title.y = element_blank()),p1[[1]][[3]]+ theme( axis.title.y = element_blank()),
+#                        p1[[2]][[1]], p1[[2]][[2]]+ theme( axis.title.y = element_blank()), p1[[2]][[3]]+ theme( axis.title.y = element_blank()),
+#                        p1[[3]][[1]], p1[[3]][[2]]+ theme( axis.title.y = element_blank()), p1[[3]][[3]]+ theme( axis.title.y = element_blank()),
+#                        ncol=3,nrow=3, common.legend = TRUE, legend = "bottom")
+# 
+#     annotate_figure(figure2)
+#     
+
+   knitr::include_graphics(paste0(wd,'/US log(Yield) for climate 3x3.jpeg'))
+   
+```
+
+
+
+
+
+
+
+
